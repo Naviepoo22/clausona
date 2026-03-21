@@ -35,6 +35,7 @@ claude() {
   if [[ -z "\${CLAUDE_CONFIG_DIR:-}" ]]; then
     _clausona_resolve_config
   fi
+  clausona _sync-plugins 2>/dev/null
   command claude "\$@"
   local rc=\$?
   unset CLAUDE_CONFIG_DIR

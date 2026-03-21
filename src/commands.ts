@@ -14,6 +14,7 @@ import {
   removeProfile,
   repairProfile,
   setActiveProfileByName,
+  syncPluginsJson,
   updateProfileConfig,
   shellInit,
   uninstallClausona,
@@ -443,6 +444,14 @@ export async function runCommand(command: string, args: string[]) {
 
     case "run": {
       throw new Error("Usage: clausona run <profile> [claude-args...]");
+    }
+
+    case "_sync-plugins": {
+      const registry = await loadRegistry();
+      if (!registry) return "";
+      const configDir = process.env.CLAUDE_CONFIG_DIR ?? registry.primarySource;
+      await syncPluginsJson(configDir, registry.primarySource).catch(() => {});
+      return "";
     }
 
     case "_track-usage": {
