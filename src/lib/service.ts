@@ -197,7 +197,7 @@ async function mergeSessionFiles(sourceDir: string, primarySource: string) {
   return merged;
 }
 
-async function setupSharedLinks(profileDir: string, primarySource: string, mergeSessions = false) {
+async function setupSharedLinks(profileDir: string, primarySource: string, mergeSessions = false, backupDir?: string) {
   const items = await readdir(primarySource, { withFileTypes: true });
   const skipSet = sharedLinkSkipSet(mergeSessions);
   let linked = 0;
@@ -226,6 +226,12 @@ async function setupSharedLinks(profileDir: string, primarySource: string, merge
         if (currentTarget === source) {
           linked += 1;
           continue;
+        }
+      } else if (backupDir) {
+        // Real data — save to backup before removing
+        const backupTarget = path.join(backupDir, item.name);
+        if (!(await exists(backupTarget))) {
+          await cp(target, backupTarget, { recursive: true });
         }
       }
       await rm(target, { force: true, recursive: true });
@@ -585,7 +591,7 @@ export async function initializeRegistry(options: {
       if (merge) {
         await mergeSessionFiles(account.configDir, PRIMARY_SOURCE);
       }
-      await setupSharedLinks(account.configDir, PRIMARY_SOURCE, merge);
+      await setupSharedLinks(account.configDir, PRIMARY_SOURCE, merge, backupDir);
       await mergePluginFiles(path.join(account.configDir, "plugins"), path.join(PRIMARY_SOURCE, "plugins"));
       await setupPluginsDir(account.configDir, PRIMARY_SOURCE);
     }
@@ -821,12 +827,12 @@ export async function repairProfile(name: string) {
     return { repaired: 0 };
   }
 
-  const repaired = await setupSharedLinks(profile.configDir, registry.primarySource, profile.mergeSessions ?? false);
+  const backupDir = path.join(CLAUSONA_DIR, "backups", name);
+  const repaired = await setupSharedLinks(profile.configDir, registry.primarySource, profile.mergeSessions ?? false, backupDir);
   await setupPluginsDir(profile.configDir, registry.primarySource);
 
   // Restore skip-set items from backup if they were stale symlinks that got removed
   // Skip if the backup item is a symlink pointing to primary (stale)
-  const backupDir = path.join(CLAUSONA_DIR, "backups", name);
   if (await exists(backupDir)) {
     const skipSet = sharedLinkSkipSet(profile.mergeSessions ?? false);
     for (const itemName of skipSet) {
@@ -867,13 +873,13 @@ export async function updateProfileConfig(name: string, options: { mergeSessions
 
   profile.mergeSessions = next;
   await saveRegistry(registry);
-  await setupSharedLinks(profile.configDir, registry.primarySource, next);
+  const backupDir = path.join(CLAUSONA_DIR, "backups", name);
+  await setupSharedLinks(profile.configDir, registry.primarySource, next, backupDir);
   await setupPluginsDir(profile.configDir, registry.primarySource);
 
   // merged → separated: restore skip-set items from backup
   // Skip if the backup item is a symlink pointing to primary (stale)
   if (!next) {
-    const backupDir = path.join(CLAUSONA_DIR, "backups", name);
     if (await exists(backupDir)) {
       const skipSet = sharedLinkSkipSet(false);
       for (const itemName of skipSet) {
@@ -921,7 +927,7 @@ export async function addProfile(options: { name: string; fromPath?: string; mer
     if (mergeSessions) {
       await mergeSessionFiles(configDir, registry.primarySource);
     }
-    await setupSharedLinks(configDir, registry.primarySource, mergeSessions);
+    await setupSharedLinks(configDir, registry.primarySource, mergeSessions, backupDir);
     await mergePluginFiles(path.join(configDir, "plugins"), path.join(registry.primarySource, "plugins"));
     await setupPluginsDir(configDir, registry.primarySource);
     registry.profiles[options.name] = { configDir, email, orgName, mergeSessions };
@@ -982,7 +988,7 @@ export async function addProfile(options: { name: string; fromPath?: string; mer
   await cp(configDir, backupDir, { recursive: true });
 
   const mergeSessions = options.mergeSessions ?? false;
-  await setupSharedLinks(configDir, registry.primarySource, mergeSessions);
+  await setupSharedLinks(configDir, registry.primarySource, mergeSessions, backupDir);
   await setupPluginsDir(configDir, registry.primarySource);
   registry.profiles[options.name] = {
     configDir,
