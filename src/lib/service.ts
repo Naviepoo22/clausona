@@ -7,7 +7,13 @@ import { evaluateSymlinkHealth } from "../core/doctor.js";
 import { seedSeenSessions } from "../core/track-usage.js";
 
 /** Items that should never be shared via symlink between profiles */
-const BASE_SHARED_LINK_SKIP = new Set([".claude.json", "image-cache", "statsig"]);
+// plugins/ is excluded because installed_plugins.json and known_marketplaces.json contain
+// absolute installPath/installLocation values that must be per-profile; setupPluginsDir
+// creates a real dir with inner symlinks instead of a wholesale symlink.
+const BASE_SHARED_LINK_SKIP = new Set([".claude.json", "image-cache", "statsig", "plugins"]);
+
+/** Files inside plugins/ that contain absolute paths and must be per-profile */
+const PLUGINS_PATH_FILES = new Set(["known_marketplaces.json", "installed_plugins.json"]);
 
 function sharedLinkSkipSet(mergeSessions: boolean): Set<string> {
   if (!mergeSessions) return new Set([...BASE_SHARED_LINK_SKIP, "projects"]);
@@ -232,6 +238,247 @@ async function setupSharedLinks(profileDir: string, primarySource: string, merge
   return linked;
 }
 
+export async function syncPluginsJson(configDir: string, primarySource: string): Promise<void> {
+  try {
+    const knownPath = path.join(configDir, "plugins", "known_marketplaces.json");
+    const knownJson = await readJson<Record<string, unknown>>(knownPath, {});
+
+    const marketplacesDir = path.join(primarySource, "plugins", "marketplaces");
+    const marketplaceDirs = await readdir(marketplacesDir, { withFileTypes: true }).catch(() => []);
+    const onDisk = new Set(marketplaceDirs.filter((e) => e.isDirectory()).map((e) => e.name));
+
+    // Sync known_marketplaces.json
+    const syncedKnown: Record<string, unknown> = {};
+    for (const [name, entry] of Object.entries(knownJson)) {
+      if (!onDisk.has(name)) continue; // in JSON but not on disk → drop
+      const e = entry as Record<string, unknown>;
+      syncedKnown[name] = {
+        ...e,
+        installLocation: path.join(configDir, "plugins", "marketplaces", name),
+      };
+    }
+
+    const registry = await loadRegistry();
+    for (const name of onDisk) {
+      if (syncedKnown[name]) continue; // already handled above
+      // On disk but not in JSON — look up metadata from registered profiles
+      let found: Record<string, unknown> | null = null;
+      if (registry) {
+        for (const profile of Object.values(registry.profiles)) {
+          const otherKnown = await readJson<Record<string, unknown>>(
+            path.join(profile.configDir, "plugins", "known_marketplaces.json"),
+            {},
+          );
+          if (otherKnown[name]) {
+            found = otherKnown[name] as Record<string, unknown>;
+            break;
+          }
+        }
+      }
+
+      if (found) {
+        syncedKnown[name] = {
+          ...found,
+          installLocation: path.join(configDir, "plugins", "marketplaces", name),
+        };
+        continue;
+      }
+
+      // Try reading .git/config for source metadata
+      let sourceInfo: Record<string, unknown> = {};
+      try {
+        const gitConfig = await readFile(
+          path.join(primarySource, "plugins", "marketplaces", name, ".git", "config"),
+          "utf8",
+        );
+        const remoteSection = gitConfig.match(/\[remote "origin"\][^\[]*url\s*=\s*(.+)/);
+        if (remoteSection) {
+          const url = remoteSection[1].trim();
+          const ghMatch = url.match(/github\.com[:/](.+?)(?:\.git)?$/);
+          if (ghMatch) {
+            sourceInfo = { source: "github", repo: ghMatch[1] };
+          } else {
+            sourceInfo = { source: "git", url };
+          }
+        }
+      } catch {
+        // .git/config not readable — create minimal entry
+      }
+
+      syncedKnown[name] = {
+        ...sourceInfo,
+        installLocation: path.join(configDir, "plugins", "marketplaces", name),
+        lastUpdated: new Date().toISOString(),
+      };
+    }
+
+    await writeJson(knownPath, syncedKnown);
+
+    // Sync installed_plugins.json (v2 format: { version, plugins: { name: [entries] } })
+    const installedPath = path.join(configDir, "plugins", "installed_plugins.json");
+    type PluginEntry = Record<string, unknown> & { installPath?: string };
+    type InstalledPlugins = { version?: number; plugins?: Record<string, PluginEntry[]> };
+    let installedJson = await readJson<InstalledPlugins | null>(installedPath, null);
+    if (installedJson === null) {
+      installedJson = await readJson<InstalledPlugins>(
+        path.join(primarySource, "plugins", "installed_plugins.json"),
+        { version: 2, plugins: {} },
+      );
+    }
+
+    const syncedPlugins: Record<string, PluginEntry[]> = {};
+    for (const [pluginName, entries] of Object.entries(installedJson.plugins ?? {})) {
+      const syncedEntries: PluginEntry[] = [];
+      for (const entry of entries) {
+        if (entry.installPath) {
+          const resolved = await realpath(entry.installPath).catch(() => null);
+          if (!resolved) continue; // target doesn't exist — remove entry
+          const pluginsIdx = entry.installPath.indexOf("/plugins/");
+          const newInstallPath =
+            pluginsIdx !== -1 ? path.join(configDir, entry.installPath.slice(pluginsIdx + 1)) : entry.installPath;
+          syncedEntries.push({ ...entry, installPath: newInstallPath });
+        } else {
+          syncedEntries.push(entry);
+        }
+      }
+      if (syncedEntries.length > 0) {
+        syncedPlugins[pluginName] = syncedEntries;
+      }
+    }
+
+    await writeJson(installedPath, { version: installedJson.version ?? 2, plugins: syncedPlugins });
+  } catch {
+    // Never block Claude from launching
+  }
+}
+
+async function mergePluginFiles(profilePluginsDir: string, primaryPluginsDir: string): Promise<void> {
+  // 1. Merge marketplaces dirs
+  try {
+    const srcMarketplaces = path.join(profilePluginsDir, "marketplaces");
+    const dstMarketplaces = path.join(primaryPluginsDir, "marketplaces");
+    const marketplaceDirs = await readdir(srcMarketplaces, { withFileTypes: true }).catch(() => []);
+    for (const entry of marketplaceDirs) {
+      if (!entry.isDirectory()) continue;
+      const dst = path.join(dstMarketplaces, entry.name);
+      if (await exists(dst)) continue;
+      try {
+        await cp(path.join(srcMarketplaces, entry.name), dst, { recursive: true });
+      } catch {
+        // best-effort
+      }
+    }
+  } catch {
+    // best-effort
+  }
+
+  // 2. Merge cache items
+  try {
+    const srcCache = path.join(profilePluginsDir, "cache");
+    const dstCache = path.join(primaryPluginsDir, "cache");
+    const cacheItems = await readdir(srcCache, { withFileTypes: true }).catch(() => []);
+    for (const entry of cacheItems) {
+      const dst = path.join(dstCache, entry.name);
+      if (await exists(dst)) continue;
+      try {
+        await cp(path.join(srcCache, entry.name), dst, { recursive: true });
+      } catch {
+        // best-effort
+      }
+    }
+  } catch {
+    // best-effort
+  }
+
+  // 3. Merge known_marketplaces.json entries
+  try {
+    const srcKnown = await readJson<Record<string, unknown>>(
+      path.join(profilePluginsDir, "known_marketplaces.json"),
+      {},
+    );
+    const dstKnownPath = path.join(primaryPluginsDir, "known_marketplaces.json");
+    const dstKnown = await readJson<Record<string, unknown>>(dstKnownPath, {});
+    let changed = false;
+    for (const [name, entry] of Object.entries(srcKnown)) {
+      if (dstKnown[name]) continue;
+      const e = entry as Record<string, unknown>;
+      dstKnown[name] = {
+        ...e,
+        installLocation: path.join(primaryPluginsDir, "marketplaces", name),
+      };
+      changed = true;
+    }
+    if (changed) await writeJson(dstKnownPath, dstKnown);
+  } catch {
+    // best-effort
+  }
+
+  // 4. Merge installed_plugins.json entries (v2 format: { version, plugins: { name: [entries] } })
+  try {
+    type PluginEntry = Record<string, unknown> & { installPath?: string };
+    type InstalledPlugins = { version?: number; plugins?: Record<string, PluginEntry[]> };
+    const srcInstalled = await readJson<InstalledPlugins>(
+      path.join(profilePluginsDir, "installed_plugins.json"),
+      { plugins: {} },
+    );
+    const dstInstalledPath = path.join(primaryPluginsDir, "installed_plugins.json");
+    const dstInstalled = await readJson<InstalledPlugins>(dstInstalledPath, { version: 2, plugins: {} });
+    const dstPlugins = dstInstalled.plugins ?? {};
+    let changed = false;
+    for (const [pluginName, entries] of Object.entries(srcInstalled.plugins ?? {})) {
+      if (dstPlugins[pluginName]) continue;
+      dstPlugins[pluginName] = entries.map((entry) => {
+        if (entry.installPath) {
+          const pluginsIdx = entry.installPath.indexOf("/plugins/");
+          const newInstallPath =
+            pluginsIdx !== -1 ? path.join(primaryPluginsDir, entry.installPath.slice(pluginsIdx + "/plugins/".length)) : entry.installPath;
+          return { ...entry, installPath: newInstallPath };
+        }
+        return entry;
+      });
+      changed = true;
+    }
+    if (changed) await writeJson(dstInstalledPath, { version: dstInstalled.version ?? 2, plugins: dstPlugins });
+  } catch {
+    // best-effort
+  }
+}
+
+async function setupPluginsDir(profileDir: string, primarySource: string): Promise<void> {
+  const primaryPlugins = path.join(primarySource, "plugins");
+  if (!(await exists(primaryPlugins))) return;
+
+  const profilePlugins = path.join(profileDir, "plugins");
+
+  // Migration: remove wholesale symlink if present
+  const profilePluginsStats = await lstat(profilePlugins).catch(() => null);
+  if (profilePluginsStats?.isSymbolicLink()) {
+    await rm(profilePlugins);
+  }
+
+  await mkdir(profilePlugins, { recursive: true });
+
+  const items = await readdir(primaryPlugins, { withFileTypes: true });
+  for (const item of items) {
+    if (PLUGINS_PATH_FILES.has(item.name)) continue; // syncPluginsJson handles these
+
+    const source = path.join(primaryPlugins, item.name);
+    const target = path.join(profilePlugins, item.name);
+    const targetExists = await exists(target);
+    if (targetExists) {
+      const stats = await lstat(target);
+      if (stats.isSymbolicLink()) {
+        const currentTarget = await readlink(target);
+        if (currentTarget === source) continue;
+      }
+      await rm(target, { force: true, recursive: true });
+    }
+    await symlink(source, target);
+  }
+
+  await syncPluginsJson(profileDir, primarySource);
+}
+
 export async function validateConfigDir(
   inputPath: string,
   registeredDirs: string[],
@@ -339,6 +586,8 @@ export async function initializeRegistry(options: {
         await mergeSessionFiles(account.configDir, PRIMARY_SOURCE);
       }
       await setupSharedLinks(account.configDir, PRIMARY_SOURCE, merge);
+      await mergePluginFiles(path.join(account.configDir, "plugins"), path.join(PRIMARY_SOURCE, "plugins"));
+      await setupPluginsDir(account.configDir, PRIMARY_SOURCE);
     }
   }
 
@@ -515,6 +764,39 @@ export async function doctorProfiles(): Promise<DoctorProfileResult[]> {
       }),
     );
 
+    // Check plugins/ consistency for non-primary profiles with a real plugins/ dir
+    if (!profile.isPrimary) {
+      const profilePlugins = path.join(profile.configDir, "plugins");
+      const pluginsStats = await lstat(profilePlugins).catch(() => null);
+      if (pluginsStats && !pluginsStats.isSymbolicLink()) {
+        const knownJson = await readJson<Record<string, unknown>>(
+          path.join(profilePlugins, "known_marketplaces.json"),
+          {},
+        );
+        const marketplaceDirs = await readdir(path.join(profilePlugins, "marketplaces"), { withFileTypes: true }).catch(() => []);
+        const onDisk = new Set(marketplaceDirs.filter((e) => e.isDirectory()).map((e) => e.name));
+
+        let pluginsOutOfSync = false;
+        for (const name of onDisk) {
+          if (!knownJson[name]) { pluginsOutOfSync = true; break; }
+        }
+        if (!pluginsOutOfSync) {
+          for (const [name, entry] of Object.entries(knownJson)) {
+            if (!onDisk.has(name)) { pluginsOutOfSync = true; break; }
+            const e = entry as Record<string, unknown>;
+            if (e.installLocation !== path.join(profile.configDir, "plugins", "marketplaces", name)) {
+              pluginsOutOfSync = true;
+              break;
+            }
+          }
+        }
+
+        if (pluginsOutOfSync) {
+          issues.push({ kind: "plugins_out_of_sync", message: "plugins/ marketplaces and known_marketplaces.json are out of sync" });
+        }
+      }
+    }
+
     results.push({
       name,
       email: profile.email,
@@ -540,6 +822,7 @@ export async function repairProfile(name: string) {
   }
 
   const repaired = await setupSharedLinks(profile.configDir, registry.primarySource, profile.mergeSessions ?? false);
+  await setupPluginsDir(profile.configDir, registry.primarySource);
 
   // Restore skip-set items from backup if they were stale symlinks that got removed
   // Skip if the backup item is a symlink pointing to primary (stale)
@@ -585,6 +868,7 @@ export async function updateProfileConfig(name: string, options: { mergeSessions
   profile.mergeSessions = next;
   await saveRegistry(registry);
   await setupSharedLinks(profile.configDir, registry.primarySource, next);
+  await setupPluginsDir(profile.configDir, registry.primarySource);
 
   // merged → separated: restore skip-set items from backup
   // Skip if the backup item is a symlink pointing to primary (stale)
@@ -638,6 +922,8 @@ export async function addProfile(options: { name: string; fromPath?: string; mer
       await mergeSessionFiles(configDir, registry.primarySource);
     }
     await setupSharedLinks(configDir, registry.primarySource, mergeSessions);
+    await mergePluginFiles(path.join(configDir, "plugins"), path.join(registry.primarySource, "plugins"));
+    await setupPluginsDir(configDir, registry.primarySource);
     registry.profiles[options.name] = { configDir, email, orgName, mergeSessions };
     await saveRegistry(registry);
     await seedSeenSessions(options.name, configDir);
@@ -697,6 +983,7 @@ export async function addProfile(options: { name: string; fromPath?: string; mer
 
   const mergeSessions = options.mergeSessions ?? false;
   await setupSharedLinks(configDir, registry.primarySource, mergeSessions);
+  await setupPluginsDir(configDir, registry.primarySource);
   registry.profiles[options.name] = {
     configDir,
     email,
@@ -725,7 +1012,21 @@ export async function loginProfile(name: string) {
 async function cleanupProfile(name: string, profile: { configDir: string; isPrimary?: boolean }) {
   if (profile.isPrimary) return;
 
-  // 1. Strip all symlinks from profile directory
+  // 1a. Strip inner symlinks from plugins/ dir (real dir with inner symlinks)
+  const profilePlugins = path.join(profile.configDir, "plugins");
+  const pluginsStats = await lstat(profilePlugins).catch(() => null);
+  if (pluginsStats && !pluginsStats.isSymbolicLink()) {
+    const pluginEntries = await readdir(profilePlugins, { withFileTypes: true }).catch(() => []);
+    for (const entry of pluginEntries) {
+      const p = path.join(profilePlugins, entry.name);
+      const stats = await lstat(p);
+      if (stats.isSymbolicLink()) {
+        await rm(p);
+      }
+    }
+  }
+
+  // 1b. Strip all symlinks from profile directory
   const entries = await readdir(profile.configDir, { withFileTypes: true }).catch(() => []);
   for (const entry of entries) {
     const p = path.join(profile.configDir, entry.name);
@@ -777,6 +1078,8 @@ export async function resolveProfileEnv(name: string): Promise<{ configDir: stri
   } else {
     env.CLAUDE_CONFIG_DIR = profile.configDir;
   }
+
+  await syncPluginsJson(profile.configDir, registry.primarySource).catch(() => {});
 
   return { configDir: profile.configDir, env };
 }
