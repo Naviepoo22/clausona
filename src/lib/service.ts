@@ -92,6 +92,7 @@ async function execCommand(
         stdio: "inherit",
       });
       child.on("close", (code) => resolve({ code: code ?? 1, stdout: "", stderr: "" }));
+      child.on("error", () => resolve({ code: 1, stdout: "", stderr: "" }));
       return;
     }
 
@@ -119,6 +120,9 @@ async function execCommand(
     child.on("close", (code) => {
       resolve({ code: code ?? 1, stdout, stderr });
     });
+    child.on("error", () => {
+      resolve({ code: 1, stdout, stderr });
+    });
   });
 }
 
@@ -131,6 +135,9 @@ async function runLoginFlow(configDir: string): Promise<boolean> {
 }
 
 async function checkKeychain(service: string) {
+  if (process.platform !== "darwin") {
+    return false;
+  }
   const result = await execCommand("security", ["find-generic-password", "-s", service], { quiet: true });
   return result.code === 0;
 }
@@ -525,7 +532,7 @@ export async function discoverAccounts(): Promise<DiscoveredAccount[]> {
       configDir: resolvedConfig,
     });
 
-    if (!(await checkKeychain(keychainService))) {
+    if (process.platform === "darwin" && !(await checkKeychain(keychainService))) {
       continue;
     }
 
@@ -723,7 +730,7 @@ export async function doctorProfiles(): Promise<DoctorProfileResult[]> {
       homeDir: homedir(),
       configDir: resolvedDir,
     });
-    if (!(await checkKeychain(keychainService))) {
+    if (process.platform === "darwin" && !(await checkKeychain(keychainService))) {
       issues.push({ kind: "missing_keychain", message: `${keychainService} not found in Keychain` });
     }
 
