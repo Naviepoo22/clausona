@@ -1,54 +1,48 @@
 import { spawn } from "node:child_process";
-import { cp, lstat, mkdir, readdir, readFile, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  cp,
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  readlink,
+  realpath,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 
 import { evaluateSymlinkHealth } from "../core/doctor.js";
-import { seedSeenSessions } from "../core/track-usage.js";
-
-/** Items that should never be shared via symlink between profiles */
-// plugins/ is excluded because installed_plugins.json and known_marketplaces.json contain
-// absolute installPath/installLocation values that must be per-profile; setupPluginsDir
-// creates a real dir with inner symlinks instead of a wholesale symlink.
-const BASE_SHARED_LINK_SKIP = new Set([".claude.json", "image-cache", "statsig", "plugins"]);
-
-/** Files inside plugins/ that contain absolute paths and must be per-profile */
-const PLUGINS_PATH_FILES = new Set(["known_marketplaces.json", "installed_plugins.json"]);
-
-function sharedLinkSkipSet(mergeSessions: boolean): Set<string> {
-  if (!mergeSessions) return new Set([...BASE_SHARED_LINK_SKIP, "projects"]);
-  return BASE_SHARED_LINK_SKIP;
-}
-
-import { claudeJsonPathForConfigDir, keychainServiceForConfigDir } from "../core/paths.js";
-import { setActiveProfile } from "../core/registry.js";
+import { backupDirFor, claudeJsonPathForConfigDir } from "../core/paths.js";
+import { isV1Registry, migrateRegistryV1toV2, setActiveProfile } from "../core/registry.js";
 import { renderShellInit } from "../core/shell.js";
+import { seedSeenSessions } from "../core/track-usage.js";
 import { summarizeUsage } from "../core/usage.js";
+import { allAdapters, getAdapter } from "../tools/registry.js";
+import type { ToolAdapter } from "../tools/types.js";
 import type {
   DiscoveredAccount,
   DoctorIssue,
   DoctorProfileResult,
+  Profile,
   ProfileListItem,
   Registry,
+  RegistryV1,
+  ToolName,
   UsagePeriod,
   UsageStore,
 } from "../types.js";
+import { profileId } from "./profile-ref.js";
+
+/** Files inside plugins/ that contain absolute paths and must be per-profile */
+const PLUGINS_PATH_FILES = new Set(["known_marketplaces.json", "installed_plugins.json"]);
 
 const CLAUSONA_DIR = path.join(homedir(), ".clausona");
 const REGISTRY_PATH = path.join(CLAUSONA_DIR, "profiles.json");
 const USAGE_PATH = path.join(CLAUSONA_DIR, "usage.json");
-const PRIMARY_SOURCE = path.join(homedir(), ".claude");
-
-type ClaudeJson = {
-  oauthAccount?: {
-    emailAddress?: string;
-    organizationName?: string;
-    displayName?: string;
-  };
-  lastCost?: number;
-  lastTotalInputTokens?: number;
-  lastTotalOutputTokens?: number;
-};
 
 async function exists(targetPath: string) {
   try {
@@ -68,17 +62,15 @@ async function readJson<T>(targetPath: string, fallback: T): Promise<T> {
   }
 }
 
-async function writeJson(targetPath: string, value: unknown) {
-  await mkdir(path.dirname(targetPath), { recursive: true });
-  await writeFile(targetPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+function warn(message: string): void {
+  process.stderr.write(`  warn: ${message}\n`);
 }
 
-async function parseClaudeJson(jsonPath: string): Promise<ClaudeJson | null> {
-  if (!(await exists(jsonPath))) {
-    return null;
-  }
-
-  return readJson<ClaudeJson | null>(jsonPath, null);
+async function writeJson(targetPath: string, value: unknown) {
+  await mkdir(path.dirname(targetPath), { recursive: true });
+  const tmpPath = `${targetPath}.tmp.${process.pid}`;
+  await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await rename(tmpPath, targetPath);
 }
 
 async function execCommand(
@@ -127,22 +119,6 @@ async function execCommand(
   });
 }
 
-async function runLoginFlow(configDir: string): Promise<boolean> {
-  const result = await execCommand("claude", ["auth", "login"], {
-    env: { CLAUDE_CONFIG_DIR: configDir },
-    interactive: true,
-  });
-  return result.code === 0;
-}
-
-async function checkKeychain(service: string) {
-  if (process.platform !== "darwin") {
-    return false;
-  }
-  const result = await execCommand("security", ["find-generic-password", "-s", service], { quiet: true });
-  return result.code === 0;
-}
-
 function defaultProfileNameForConfigDir(configDir: string) {
   const base = path.basename(configDir);
   if (base === ".claude") {
@@ -156,17 +132,10 @@ async function ensureStorage() {
   await mkdir(CLAUSONA_DIR, { recursive: true });
 }
 
-async function listConfigCandidates() {
-  const home = homedir();
-  const entries = await readdir(home, { withFileTypes: true });
-  return entries
-    .filter((entry) => entry.isDirectory())
-    .map((entry) => path.join(home, entry.name))
-    .filter((dir) => {
-      const base = path.basename(dir);
-      return base === ".claude" || base.startsWith(".claude-");
-    })
-    .sort();
+function shouldSkipShare(adapter: ToolAdapter, name: string, mergeSessions: boolean): boolean {
+  if (adapter.sharedSkipSet(mergeSessions).has(name)) return true;
+  if (adapter.shouldSkipName?.(name, mergeSessions)) return true;
+  return false;
 }
 
 async function mergeSessionFiles(sourceDir: string, primarySource: string) {
@@ -194,8 +163,8 @@ async function mergeSessionFiles(sourceDir: string, primarySource: string) {
       try {
         await cp(path.join(srcSlug, item.name), dstItem, { recursive: true });
         merged++;
-      } catch {
-        // best-effort: skip failed items, backup has the originals
+      } catch (e) {
+        warn(`mergeSessionFiles: could not copy ${item.name}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
 
@@ -205,15 +174,20 @@ async function mergeSessionFiles(sourceDir: string, primarySource: string) {
   return merged;
 }
 
-async function setupSharedLinks(profileDir: string, primarySource: string, mergeSessions = false, backupDir?: string) {
+export async function setupSharedLinks(
+  adapter: ToolAdapter,
+  profileDir: string,
+  primarySource: string,
+  mergeSessions = false,
+  backupDir?: string,
+) {
   const items = await readdir(primarySource, { withFileTypes: true });
-  const skipSet = sharedLinkSkipSet(mergeSessions);
   let linked = 0;
 
   for (const item of items) {
     const source = path.join(primarySource, item.name);
 
-    if (skipSet.has(item.name)) {
+    if (shouldSkipShare(adapter, item.name, mergeSessions)) {
       // Remove symlinks to primary for skipped items (e.g. projects/ when separated)
       const target = path.join(profileDir, item.name);
       const targetStats = await lstat(target).catch(() => null);
@@ -497,62 +471,127 @@ async function setupPluginsDir(profileDir: string, primarySource: string): Promi
 export async function validateConfigDir(
   inputPath: string,
   registeredDirs: string[],
-): Promise<{ error: string } | { account: { configDir: string; email: string; orgName?: string } }> {
+): Promise<{ error: string } | { account: { tool: ToolName; configDir: string; email: string; orgName?: string } }> {
   const configDir = inputPath.replace(/^~(?=$|\/)/, homedir());
   if (!(await exists(configDir))) {
     return { error: "Directory not found" };
   }
-  const jsonPath = claudeJsonPathForConfigDir({ homeDir: homedir(), configDir });
-  const claudeJson = await parseClaudeJson(jsonPath);
-  const email = claudeJson?.oauthAccount?.emailAddress;
-  if (!email) {
-    return { error: "No valid .claude.json with oauthAccount found" };
-  }
   if (registeredDirs.includes(configDir)) {
     return { error: "This directory is already registered" };
   }
-  return { account: { configDir, email, orgName: claudeJson.oauthAccount?.organizationName } };
+
+  for (const adapter of allAdapters()) {
+    const account = await adapter.readAccountInfo(configDir);
+    if (account) {
+      return { account: { tool: adapter.name, configDir, email: account.email, orgName: account.orgName } };
+    }
+  }
+
+  return { error: "No valid Claude or Codex account found at this path" };
 }
 
 export async function discoverAccounts(): Promise<DiscoveredAccount[]> {
   const home = homedir();
-  const dirs = await listConfigCandidates();
-  const discovered: DiscoveredAccount[] = [];
+  const out: DiscoveredAccount[] = [];
 
-  for (const configDir of dirs) {
-    const jsonPath = claudeJsonPathForConfigDir({ homeDir: home, configDir });
-    const claudeJson = await parseClaudeJson(jsonPath);
-    const email = claudeJson?.oauthAccount?.emailAddress;
-    if (!email) {
-      continue;
+  const entries = await readdir(home, { withFileTypes: true });
+  for (const adapter of allAdapters()) {
+    const matchingDirs = entries
+      .filter((e) => e.isDirectory() && adapter.configDirPattern.test(e.name))
+      .map((e) => path.join(home, e.name))
+      .sort();
+
+    for (const configDir of matchingDirs) {
+      const account = await adapter.readAccountInfo(configDir);
+      if (!account) continue;
+
+      const resolvedConfig = await realpath(configDir).catch(() => configDir);
+      const resolvedPrimary = await realpath(adapter.defaultConfigDir(home)).catch(() =>
+        adapter.defaultConfigDir(home),
+      );
+      const isPrimary = resolvedConfig === resolvedPrimary;
+
+      // Per-tool credential gate (Claude requires Keychain on macOS)
+      if (adapter.keychainServiceName && adapter.hasKeychainCredential) {
+        const service = adapter.keychainServiceName({ homeDir: home, configDir: resolvedConfig });
+        if (process.platform === "darwin" && !(await adapter.hasKeychainCredential(service))) {
+          continue;
+        }
+      }
+
+      const jsonPath =
+        adapter.name === "claude"
+          ? claudeJsonPathForConfigDir({ homeDir: home, configDir })
+          : path.join(configDir, "auth.json");
+
+      out.push({
+        tool: adapter.name,
+        configDir,
+        jsonPath,
+        email: account.email,
+        orgName: account.orgName,
+        keychainService: adapter.keychainServiceName?.({ homeDir: home, configDir: resolvedConfig }) ?? "",
+        isPrimary,
+      });
     }
-
-    const resolvedConfig = await realpath(configDir).catch(() => configDir);
-    const resolvedPrimary = await realpath(path.join(home, ".claude")).catch(() => path.join(home, ".claude"));
-    const keychainService = keychainServiceForConfigDir({
-      homeDir: home,
-      configDir: resolvedConfig,
-    });
-
-    if (process.platform === "darwin" && !(await checkKeychain(keychainService))) {
-      continue;
-    }
-
-    discovered.push({
-      configDir,
-      jsonPath,
-      email,
-      orgName: claudeJson.oauthAccount?.organizationName,
-      keychainService,
-      isPrimary: resolvedConfig === resolvedPrimary,
-    });
   }
 
-  return discovered;
+  return out;
 }
 
-export async function loadRegistry() {
-  return readJson<Registry | null>(REGISTRY_PATH, null);
+export async function loadRegistry(): Promise<Registry | null> {
+  const raw = await readJson<unknown>(REGISTRY_PATH, null);
+  if (raw === null) return null;
+  if (!isV1Registry(raw)) return raw as Registry;
+
+  // Migrate v1 → v2 in place with backups
+
+  // 1. Backup the v1 profiles.json (only if backup doesn't already exist)
+  const regBak = `${REGISTRY_PATH}.v1.bak`;
+  if (!(await exists(regBak))) {
+    await cp(REGISTRY_PATH, regBak).catch((e) =>
+      warn(`migration: could not backup profiles.json: ${e instanceof Error ? e.message : String(e)}`),
+    );
+  }
+
+  const v1 = raw as RegistryV1;
+  const migrated = migrateRegistryV1toV2(v1);
+  await writeJson(REGISTRY_PATH, migrated);
+
+  // 2. Backup directory layout migration: backups/<name>/ → backups/claude/<name>/
+  const backupsDir = path.join(CLAUSONA_DIR, "backups");
+  const backupEntries = await readdir(backupsDir, { withFileTypes: true }).catch(() => []);
+  for (const entry of backupEntries) {
+    if (!entry.isDirectory()) continue;
+    if (entry.name === "claude" || entry.name === "codex") continue; // already-new layout
+    const src = path.join(backupsDir, entry.name);
+    const dst = path.join(backupsDir, "claude", entry.name);
+    await mkdir(path.dirname(dst), { recursive: true });
+    await rename(src, dst).catch((e) =>
+      warn(`migration: could not move backup ${entry.name}: ${e instanceof Error ? e.message : String(e)}`),
+    );
+  }
+
+  // 3. Usage store key rename: <name> → claude:<name>
+  const usageRaw = await readJson<Record<string, unknown> | null>(USAGE_PATH, null);
+  if (usageRaw && Object.keys(usageRaw).some((k) => !k.includes(":"))) {
+    const usageBak = `${USAGE_PATH}.v1.bak`;
+    if (!(await exists(usageBak))) {
+      await cp(USAGE_PATH, usageBak).catch((e) =>
+        warn(`migration: could not backup usage.json: ${e instanceof Error ? e.message : String(e)}`),
+      );
+    }
+    const renamed: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(usageRaw)) {
+      renamed[k.includes(":") ? k : `claude:${k}`] = v;
+    }
+    await writeJson(USAGE_PATH, renamed);
+  }
+
+  process.stderr.write(
+    "  clausona migrated registry to v2 (codex support enabled). Open a new terminal to activate the codex() wrapper.\n",
+  );
+  return migrated;
 }
 
 export async function saveRegistry(registry: Registry) {
@@ -572,18 +611,30 @@ export async function initializeRegistry(options: {
 }) {
   await ensureStorage();
 
+  const home = homedir();
+  // Build per-tool primary sources from the adapter defaults; only include tools with at least one account
+  const primarySources: Registry["primarySources"] = {};
+  for (const account of options.accounts) {
+    if (!primarySources[account.tool]) {
+      primarySources[account.tool] = getAdapter(account.tool).defaultConfigDir(home);
+    }
+  }
+
   const registry: Registry = {
-    primarySource: PRIMARY_SOURCE,
-    activeProfile: options.defaultProfile,
+    version: 2,
+    primarySources,
+    activeProfiles: {},
     profiles: {},
   };
 
   for (const account of options.accounts) {
-    const profileName = options.profileNames[account.configDir] ?? defaultProfileNameForConfigDir(account.configDir);
+    const baseName = options.profileNames[account.configDir] ?? defaultProfileNameForConfigDir(account.configDir);
+    const id = profileId(account.tool, baseName);
     const mergeSessions = account.isPrimary
       ? undefined
       : (options.mergeSessionsMap?.[account.configDir] ?? options.mergeSessions ?? false);
-    registry.profiles[profileName] = {
+    registry.profiles[id] = {
+      tool: account.tool,
       configDir: account.configDir,
       email: account.email,
       orgName: account.orgName,
@@ -593,27 +644,53 @@ export async function initializeRegistry(options: {
 
     if (!account.isPrimary) {
       const merge = mergeSessions ?? false;
-      const backupDir = path.join(CLAUSONA_DIR, "backups", profileName);
+      const backupDir = backupDirFor(CLAUSONA_DIR, account.tool, baseName);
       if (!(await exists(backupDir))) {
-        await cp(account.configDir, backupDir, { recursive: true });
+        await mkdir(backupDir, { recursive: true });
+        // Per-item backup happens inside setupSharedLinks; no need to copy the full dir.
       }
-      if (merge) {
-        await mergeSessionFiles(account.configDir, PRIMARY_SOURCE);
+      const adapter = getAdapter(account.tool);
+      const primary = primarySources[account.tool];
+      if (!primary) {
+        throw new Error(`primarySource for ${account.tool} not set — registry build invariant violated`);
       }
-      await setupSharedLinks(account.configDir, PRIMARY_SOURCE, merge, backupDir);
-      await mergePluginFiles(path.join(account.configDir, "plugins"), path.join(PRIMARY_SOURCE, "plugins"));
-      await setupPluginsDir(account.configDir, PRIMARY_SOURCE);
+      if (merge && account.tool === "claude") {
+        await mergeSessionFiles(account.configDir, primary);
+      }
+      await setupSharedLinks(adapter, account.configDir, primary, merge, backupDir);
+      if (account.tool === "claude") {
+        await mergePluginFiles(path.join(account.configDir, "plugins"), path.join(primary, "plugins"));
+        await setupPluginsDir(account.configDir, primary);
+      }
     }
   }
 
+  // Determine activeProfiles map from options.defaultProfile (per-tool)
+  // defaultProfile is a bare name from CLI; resolve to claude:<name> for backwards compat.
+  const claudeAccounts = options.accounts.filter((a) => a.tool === "claude");
+  const codexAccounts = options.accounts.filter((a) => a.tool === "codex");
+  if (claudeAccounts.length > 0) {
+    const fallback =
+      options.profileNames[claudeAccounts[0].configDir] ?? defaultProfileNameForConfigDir(claudeAccounts[0].configDir);
+    const wanted = profileId("claude", options.defaultProfile);
+    registry.activeProfiles.claude = registry.profiles[wanted] ? wanted : profileId("claude", fallback);
+  }
+  if (codexAccounts.length > 0) {
+    const fallback =
+      options.profileNames[codexAccounts[0].configDir] ?? defaultProfileNameForConfigDir(codexAccounts[0].configDir);
+    registry.activeProfiles.codex = profileId("codex", fallback);
+  }
+
   await saveRegistry(registry);
-  // Reset usage on init — fresh start with seeded fingerprints
   await writeJson(USAGE_PATH, {});
 
-  // Seed seenSessions so pre-existing usage is not recorded as new
+  // Seed seenSessions for each registered profile (claude only — codex usage tracking is v1 OOS)
   for (const account of options.accounts) {
-    const profileName = options.profileNames[account.configDir] ?? defaultProfileNameForConfigDir(account.configDir);
-    await seedSeenSessions(profileName, account.configDir);
+    const baseName = options.profileNames[account.configDir] ?? defaultProfileNameForConfigDir(account.configDir);
+    const id = profileId(account.tool, baseName);
+    if (account.tool === "claude") {
+      await seedSeenSessions(id, account.configDir);
+    }
   }
 
   return registry;
@@ -628,15 +705,16 @@ export async function listProfiles(): Promise<ProfileListItem[]> {
   const usage = await loadUsageStore();
   const now = new Date().toISOString(); // summarizeUsage interprets cutoffs in the runtime's local timezone
 
-  return Object.entries(registry.profiles).map(([name, profile]) => {
-    const records = usage[name]?.records ?? [];
+  return Object.entries(registry.profiles).map(([id, profile]) => {
+    const records = usage[id]?.records ?? [];
     return {
-      name,
+      name: id,
+      tool: profile.tool,
       email: profile.email,
       orgName: profile.orgName,
       configDir: profile.configDir,
       isPrimary: Boolean(profile.isPrimary),
-      isActive: registry.activeProfile === name,
+      isActive: registry.activeProfiles[profile.tool] === id,
       mergeSessions: profile.mergeSessions,
       today: summarizeUsage({ now, period: "today", records }),
       week: summarizeUsage({ now, period: "week", records }),
@@ -646,46 +724,18 @@ export async function listProfiles(): Promise<ProfileListItem[]> {
   });
 }
 
-export async function setActiveProfileByName(name: string) {
+export async function setActiveProfileByName(id: string) {
   const registry = await loadRegistry();
-  if (!registry?.profiles[name]) {
-    throw new Error(`Profile '${name}' not found.`);
+  if (!registry?.profiles[id]) {
+    throw new Error(`Profile '${id}' not found.`);
   }
 
-  const next = setActiveProfile(registry, name);
+  const next = setActiveProfile(registry, id);
   await saveRegistry(next);
-  return next.profiles[name];
+  return next.profiles[id];
 }
 
-export async function getCurrentProfile() {
-  const registry = await loadRegistry();
-  if (!registry?.activeProfile || !registry.profiles[registry.activeProfile]) {
-    return null;
-  }
-
-  const profile = registry.profiles[registry.activeProfile];
-  const now = new Date().toISOString(); // summarizeUsage interprets cutoffs in the runtime's local timezone
-  const usage = await loadUsageStore();
-  const records = usage[registry.activeProfile]?.records ?? [];
-  const resolvedConfigDir = await realpath(profile.configDir).catch(() => profile.configDir);
-  const keychainService = keychainServiceForConfigDir({
-    homeDir: homedir(),
-    configDir: resolvedConfigDir,
-  });
-
-  return {
-    name: registry.activeProfile,
-    ...profile,
-    keychainService,
-    hasKeychain: await checkKeychain(keychainService),
-    usage: {
-      today: summarizeUsage({ now, period: "today", records }),
-      total: summarizeUsage({ now, period: "all", records }),
-    },
-  };
-}
-
-export async function getUsageSummary(profileName: string | null, period: UsagePeriod) {
+export async function getUsageSummary(profileId_: string | null, period: UsagePeriod) {
   const registry = await loadRegistry();
   if (!registry) {
     return null;
@@ -694,15 +744,15 @@ export async function getUsageSummary(profileName: string | null, period: UsageP
   const usage = await loadUsageStore();
   const now = new Date().toISOString(); // summarizeUsage interprets cutoffs in the runtime's local timezone
 
-  if (profileName) {
-    const records = usage[profileName]?.records ?? [];
+  if (profileId_) {
+    const records = usage[profileId_]?.records ?? [];
     return summarizeUsage({ now, period, records });
   }
 
   return Object.fromEntries(
-    Object.keys(registry.profiles).map((name) => [
-      name,
-      summarizeUsage({ now, period, records: usage[name]?.records ?? [] }),
+    Object.keys(registry.profiles).map((id) => [
+      id,
+      summarizeUsage({ now, period, records: usage[id]?.records ?? [] }),
     ]),
   );
 }
@@ -713,83 +763,93 @@ export async function doctorProfiles(): Promise<DoctorProfileResult[]> {
     return [];
   }
 
-  const primaryEntries = new Set(
-    (await readdir(registry.primarySource, { withFileTypes: true })).map((entry) => entry.name),
-  );
   const results: DoctorProfileResult[] = [];
 
-  for (const [name, profile] of Object.entries(registry.profiles)) {
+  for (const [id, profile] of Object.entries(registry.profiles)) {
     const issues: DoctorIssue[] = [];
-    const jsonPath = claudeJsonPathForConfigDir({ homeDir: homedir(), configDir: profile.configDir });
-    const claudeJson = await parseClaudeJson(jsonPath);
 
-    if (!claudeJson) {
-      issues.push({ kind: "missing_json", message: ".claude.json is missing" });
-    } else if (!claudeJson.oauthAccount?.emailAddress) {
-      issues.push({ kind: "missing_oauth", message: ".claude.json is missing oauthAccount.emailAddress" });
-    }
+    const primarySource = registry.primarySources[profile.tool];
+    const adapter = getAdapter(profile.tool);
 
-    const resolvedDir = await realpath(profile.configDir).catch(() => profile.configDir);
-    const keychainService = keychainServiceForConfigDir({
-      homeDir: homedir(),
-      configDir: resolvedDir,
-    });
-    if (process.platform === "darwin" && !(await checkKeychain(keychainService))) {
-      issues.push({ kind: "missing_keychain", message: `${keychainService} not found in Keychain` });
-    }
-
-    const dirEntries = await readdir(profile.configDir, { withFileTypes: true }).catch(() => []);
-    const skipSet = sharedLinkSkipSet(profile.mergeSessions ?? false);
-    const symlinkItems: Array<{
-      name: string;
-      isSymlink: boolean;
-      pointsToPrimary: boolean;
-      targetExists: boolean;
-      existsInPrimary: boolean;
-    }> = [];
-    for (const entry of dirEntries) {
-      const targetPath = path.join(profile.configDir, entry.name);
-      const stats = await lstat(targetPath);
-      const isSymlink = stats.isSymbolicLink();
-      const pointsToPrimary =
-        isSymlink && (await readlink(targetPath)) === path.join(registry.primarySource, entry.name);
-
-      if (skipSet.has(entry.name)) {
-        // Items in skip set should NOT be symlinked to primary
-        if (!profile.isPrimary && pointsToPrimary) {
-          issues.push({
-            kind: "stale_symlink",
-            message: `${entry.name} is symlinked to primary but should not be shared`,
-          });
-        }
-        continue;
+    // Run tool-aware account/keychain checks
+    {
+      const accountInfo = await adapter.readAccountInfo(profile.configDir);
+      if (!accountInfo) {
+        issues.push({
+          kind: "missing_json",
+          message:
+            profile.tool === "claude"
+              ? ".claude.json is missing or missing oauthAccount.emailAddress"
+              : "auth.json is missing or id_token is unparseable",
+        });
       }
 
-      if (isSymlink) {
-        const targetExists = await exists(await realpath(targetPath).catch(() => ""));
-        if (!targetExists) {
-          await rm(targetPath, { force: true });
+      if (adapter.keychainServiceName && adapter.hasKeychainCredential) {
+        const resolvedDir = await realpath(profile.configDir).catch(() => profile.configDir);
+        const keychainService = adapter.keychainServiceName({ homeDir: homedir(), configDir: resolvedDir });
+        if (!(await adapter.hasKeychainCredential(keychainService))) {
+          issues.push({ kind: "missing_keychain", message: `${keychainService} not found in Keychain` });
+        }
+      }
+    }
+
+    if (primarySource) {
+      const primaryEntries = new Set(
+        (await readdir(primarySource, { withFileTypes: true }).catch(() => [])).map((entry) => entry.name),
+      );
+
+      const dirEntries = await readdir(profile.configDir, { withFileTypes: true }).catch(() => []);
+      const isSkipped = (n: string) => shouldSkipShare(adapter, n, profile.mergeSessions ?? false);
+      const symlinkItems: Array<{
+        name: string;
+        isSymlink: boolean;
+        pointsToPrimary: boolean;
+        targetExists: boolean;
+        existsInPrimary: boolean;
+      }> = [];
+      for (const entry of dirEntries) {
+        const targetPath = path.join(profile.configDir, entry.name);
+        const stats = await lstat(targetPath);
+        const isSymlink = stats.isSymbolicLink();
+        const pointsToPrimary = isSymlink && (await readlink(targetPath)) === path.join(primarySource, entry.name);
+
+        if (isSkipped(entry.name)) {
+          // Items in skip set should NOT be symlinked to primary
+          if (!profile.isPrimary && pointsToPrimary) {
+            issues.push({
+              kind: "stale_symlink",
+              message: `${entry.name} is symlinked to primary but should not be shared`,
+            });
+          }
           continue;
         }
+
+        if (isSymlink) {
+          const targetExists = await exists(await realpath(targetPath).catch(() => ""));
+          if (!targetExists) {
+            await rm(targetPath, { force: true });
+            continue;
+          }
+        }
+        symlinkItems.push({
+          name: entry.name,
+          isSymlink,
+          pointsToPrimary,
+          targetExists: true,
+          existsInPrimary: primaryEntries.has(entry.name),
+        });
       }
-      symlinkItems.push({
-        name: entry.name,
-        isSymlink,
-        pointsToPrimary,
-        targetExists: true,
-        existsInPrimary: primaryEntries.has(entry.name),
-      });
+
+      issues.push(
+        ...evaluateSymlinkHealth({
+          isPrimary: Boolean(profile.isPrimary),
+          items: symlinkItems,
+        }),
+      );
     }
 
-    issues.push(
-      ...evaluateSymlinkHealth({
-        isPrimary: Boolean(profile.isPrimary),
-        items: symlinkItems,
-      }),
-    );
-
-    // Check plugins/ consistency for non-primary profiles with a real plugins/ dir
-    if (!profile.isPrimary) {
+    // Check plugins/ consistency for non-primary claude profiles with a real plugins/ dir
+    if (!profile.isPrimary && profile.tool === "claude") {
       const profilePlugins = path.join(profile.configDir, "plugins");
       const pluginsStats = await lstat(profilePlugins).catch(() => null);
       if (pluginsStats && !pluginsStats.isSymbolicLink()) {
@@ -833,7 +893,7 @@ export async function doctorProfiles(): Promise<DoctorProfileResult[]> {
     }
 
     results.push({
-      name,
+      name: id,
       email: profile.email,
       configDir: profile.configDir,
       isPrimary: Boolean(profile.isPrimary),
@@ -845,30 +905,36 @@ export async function doctorProfiles(): Promise<DoctorProfileResult[]> {
   return results;
 }
 
-export async function repairProfile(name: string) {
+export async function repairProfile(id: string) {
   const registry = await loadRegistry();
-  if (!registry?.profiles[name]) {
-    throw new Error(`Profile '${name}' not found.`);
+  if (!registry?.profiles[id]) {
+    throw new Error(`Profile '${id}' not found.`);
   }
 
-  const profile = registry.profiles[name];
+  const profile = registry.profiles[id];
   if (profile.isPrimary) {
     return { repaired: 0 };
   }
 
-  const backupDir = path.join(CLAUSONA_DIR, "backups", name);
+  const name = id.split(":").slice(1).join(":");
+  const backupDir = backupDirFor(CLAUSONA_DIR, profile.tool, name);
+  const profileAdapter = getAdapter(profile.tool);
+  const primarySource = registry.primarySources[profile.tool] ?? profileAdapter.defaultConfigDir(homedir());
   const repaired = await setupSharedLinks(
+    profileAdapter,
     profile.configDir,
-    registry.primarySource,
+    primarySource,
     profile.mergeSessions ?? false,
     backupDir,
   );
-  await setupPluginsDir(profile.configDir, registry.primarySource);
+  if (profile.tool === "claude") {
+    await setupPluginsDir(profile.configDir, primarySource);
+  }
 
   // Restore skip-set items from backup if they were stale symlinks that got removed
   // Skip if the backup item is a symlink pointing to primary (stale)
   if (await exists(backupDir)) {
-    const skipSet = sharedLinkSkipSet(profile.mergeSessions ?? false);
+    const skipSet = profileAdapter.sharedSkipSet(profile.mergeSessions ?? false);
     for (const itemName of skipSet) {
       const target = path.join(profile.configDir, itemName);
       const backupItem = path.join(backupDir, itemName);
@@ -876,7 +942,7 @@ export async function repairProfile(name: string) {
         const backupStats = await lstat(backupItem).catch(() => null);
         if (backupStats?.isSymbolicLink()) {
           const linkTarget = await readlink(backupItem);
-          if (linkTarget === path.join(registry.primarySource, itemName)) continue;
+          if (linkTarget === path.join(primarySource, itemName)) continue;
         }
         await cp(backupItem, target, { recursive: true });
       }
@@ -886,36 +952,43 @@ export async function repairProfile(name: string) {
   return { repaired };
 }
 
-export async function updateProfileConfig(name: string, options: { mergeSessions: boolean }) {
+export async function updateProfileConfig(id: string, options: { mergeSessions: boolean }) {
   const registry = await loadRegistry();
-  if (!registry?.profiles[name]) {
-    throw new Error(`Profile '${name}' not found.`);
+  if (!registry?.profiles[id]) {
+    throw new Error(`Profile '${id}' not found.`);
   }
-  const profile = registry.profiles[name];
+  const profile = registry.profiles[id];
   if (profile.isPrimary) {
     throw new Error("Cannot change session mode for the primary profile.");
   }
 
   const prev = profile.mergeSessions ?? false;
   const next = options.mergeSessions;
-  if (prev === next) return { name, mergeSessions: next, changed: false };
+  if (prev === next) return { name: id, mergeSessions: next, changed: false };
+
+  const primarySource = registry.primarySources[profile.tool] ?? getAdapter(profile.tool).defaultConfigDir(homedir());
 
   // separated → merged: merge session files before symlinking
-  if (next) {
-    await mergeSessionFiles(profile.configDir, registry.primarySource);
+  if (next && profile.tool === "claude") {
+    await mergeSessionFiles(profile.configDir, primarySource);
   }
 
   profile.mergeSessions = next;
   await saveRegistry(registry);
-  const backupDir = path.join(CLAUSONA_DIR, "backups", name);
-  await setupSharedLinks(profile.configDir, registry.primarySource, next, backupDir);
-  await setupPluginsDir(profile.configDir, registry.primarySource);
+
+  const name = id.split(":").slice(1).join(":");
+  const backupDir = backupDirFor(CLAUSONA_DIR, profile.tool, name);
+  const updateAdapter = getAdapter(profile.tool);
+  await setupSharedLinks(updateAdapter, profile.configDir, primarySource, next, backupDir);
+  if (profile.tool === "claude") {
+    await setupPluginsDir(profile.configDir, primarySource);
+  }
 
   // merged → separated: restore skip-set items from backup
   // Skip if the backup item is a symlink pointing to primary (stale)
   if (!next) {
     if (await exists(backupDir)) {
-      const skipSet = sharedLinkSkipSet(false);
+      const skipSet = updateAdapter.sharedSkipSet(false);
       for (const itemName of skipSet) {
         const target = path.join(profile.configDir, itemName);
         const backupItem = path.join(backupDir, itemName);
@@ -923,7 +996,7 @@ export async function updateProfileConfig(name: string, options: { mergeSessions
           const backupStats = await lstat(backupItem).catch(() => null);
           if (backupStats?.isSymbolicLink()) {
             const linkTarget = await readlink(backupItem);
-            if (linkTarget === path.join(registry.primarySource, itemName)) continue;
+            if (linkTarget === path.join(primarySource, itemName)) continue;
           }
           await cp(backupItem, target, { recursive: true });
         }
@@ -931,125 +1004,10 @@ export async function updateProfileConfig(name: string, options: { mergeSessions
     }
   }
 
-  return { name, mergeSessions: next, changed: true };
+  return { name: id, mergeSessions: next, changed: true };
 }
 
-export async function addProfile(options: { name: string; fromPath?: string; mergeSessions?: boolean }) {
-  const registry = await loadRegistry();
-  if (!registry) {
-    throw new Error("clausona is not initialized.");
-  }
-
-  if (registry.profiles[options.name]) {
-    throw new Error(`Profile '${options.name}' already exists.`);
-  }
-
-  if (options.fromPath) {
-    const configDir = options.fromPath.replace(/^~(?=$|\/)/, homedir());
-    const jsonPath = claudeJsonPathForConfigDir({ homeDir: homedir(), configDir });
-    const claudeJson = await parseClaudeJson(jsonPath);
-    const email = claudeJson?.oauthAccount?.emailAddress;
-    if (!email) {
-      throw new Error("Could not read account info from .claude.json");
-    }
-
-    const orgName = claudeJson.oauthAccount?.organizationName;
-    const backupDir = path.join(CLAUSONA_DIR, "backups", options.name);
-    await rm(backupDir, { force: true, recursive: true });
-    await cp(configDir, backupDir, { recursive: true });
-    const mergeSessions = options.mergeSessions ?? false;
-    if (mergeSessions) {
-      await mergeSessionFiles(configDir, registry.primarySource);
-    }
-    await setupSharedLinks(configDir, registry.primarySource, mergeSessions, backupDir);
-    await mergePluginFiles(path.join(configDir, "plugins"), path.join(registry.primarySource, "plugins"));
-    await setupPluginsDir(configDir, registry.primarySource);
-    registry.profiles[options.name] = { configDir, email, orgName, mergeSessions };
-    await saveRegistry(registry);
-    await seedSeenSessions(options.name, configDir);
-    return { name: options.name, email, configDir, backupDir };
-  }
-
-  const configDir = path.join(homedir(), `.claude-${options.name}`);
-  if (await exists(configDir)) {
-    throw new Error(
-      `${configDir.replace(homedir(), "~")} already exists. Use --from ${configDir.replace(homedir(), "~")} to import it instead.`,
-    );
-  }
-  await mkdir(configDir, { recursive: true });
-
-  // Check if credentials already exist (e.g. from a previous removed profile)
-  const resolvedDir = await realpath(configDir).catch(() => configDir);
-  const service = keychainServiceForConfigDir({ homeDir: homedir(), configDir: resolvedDir });
-  const jsonPath = path.join(configDir, ".claude.json");
-  const existingJson = await parseClaudeJson(jsonPath);
-  const alreadyAuthenticated = existingJson?.oauthAccount?.emailAddress && (await checkKeychain(service));
-
-  if (!alreadyAuthenticated) {
-    const loggedIn = await runLoginFlow(configDir);
-    if (!loggedIn) {
-      await rm(configDir, { force: true, recursive: true });
-      throw new Error("Claude login failed.");
-    }
-  }
-
-  // Merge onboarding state from primary so claude skips the setup wizard
-  const primaryJsonPath = claudeJsonPathForConfigDir({ homeDir: homedir(), configDir: PRIMARY_SOURCE });
-  const primaryJson = await readJson<Record<string, unknown>>(primaryJsonPath, {});
-  const profileJson = await readJson<Record<string, unknown>>(jsonPath, {});
-  const onboardingKeys = ["hasCompletedOnboarding", "lastOnboardingVersion"] as const;
-  let needsWrite = false;
-  for (const key of onboardingKeys) {
-    if (primaryJson[key] !== undefined && profileJson[key] === undefined) {
-      profileJson[key] = primaryJson[key];
-      needsWrite = true;
-    }
-  }
-  if (needsWrite) {
-    await writeJson(jsonPath, profileJson);
-  }
-
-  const claudeJson = await parseClaudeJson(jsonPath);
-  const email = claudeJson?.oauthAccount?.emailAddress;
-  if (!email) {
-    await rm(configDir, { force: true, recursive: true });
-    throw new Error("Login succeeded but account metadata is missing.");
-  }
-
-  // Backup before setupSharedLinks replaces files with symlinks
-  const backupDir = path.join(CLAUSONA_DIR, "backups", options.name);
-  await rm(backupDir, { force: true, recursive: true });
-  await cp(configDir, backupDir, { recursive: true });
-
-  const mergeSessions = options.mergeSessions ?? false;
-  await setupSharedLinks(configDir, registry.primarySource, mergeSessions, backupDir);
-  await setupPluginsDir(configDir, registry.primarySource);
-  registry.profiles[options.name] = {
-    configDir,
-    email,
-    orgName: claudeJson.oauthAccount?.organizationName,
-    mergeSessions,
-  };
-  await saveRegistry(registry);
-  await seedSeenSessions(options.name, configDir);
-  return { name: options.name, email, configDir };
-}
-
-export async function loginProfile(name: string) {
-  const registry = await loadRegistry();
-  if (!registry?.profiles[name]) {
-    throw new Error(`Profile '${name}' not found.`);
-  }
-
-  const loggedIn = await runLoginFlow(registry.profiles[name].configDir);
-  if (!loggedIn) {
-    throw new Error("Claude login failed.");
-  }
-
-  return registry.profiles[name];
-}
-
-async function cleanupProfile(name: string, profile: { configDir: string; isPrimary?: boolean }) {
+async function cleanupProfile(name: string, profile: Profile) {
   if (profile.isPrimary) return;
 
   // 1a. Strip inner symlinks from plugins/ dir (real dir with inner symlinks)
@@ -1077,51 +1035,219 @@ async function cleanupProfile(name: string, profile: { configDir: string; isPrim
   }
 
   // 2. Restore backup if available (original files before clausona setup)
-  const backupDir = path.join(CLAUSONA_DIR, "backups", name);
+  const backupDir = backupDirFor(CLAUSONA_DIR, profile.tool, name);
   if (await exists(backupDir)) {
     await cp(backupDir, profile.configDir, { recursive: true });
     await rm(backupDir, { force: true, recursive: true });
   }
 }
 
-export async function removeProfile(name: string) {
+export async function addProfile(options: {
+  tool: ToolName;
+  name: string;
+  fromPath?: string;
+  mergeSessions?: boolean;
+}) {
+  if (options.name === "" || options.name.includes(":")) {
+    throw new Error(`Invalid profile name '${options.name}': must be non-empty and not contain ':'.`);
+  }
+
   const registry = await loadRegistry();
-  if (!registry?.profiles[name]) {
-    throw new Error(`Profile '${name}' not found.`);
+  if (!registry) throw new Error("clausona is not initialized.");
+
+  const id = profileId(options.tool, options.name);
+  if (registry.profiles[id]) throw new Error(`Profile '${id}' already exists.`);
+
+  const adapter = getAdapter(options.tool);
+  const home = homedir();
+  const primarySource = registry.primarySources[options.tool] ?? adapter.defaultConfigDir(home);
+
+  if (options.fromPath) {
+    const configDir = options.fromPath.replace(/^~(?=$|\/)/, home);
+    const accountInfo = await adapter.readAccountInfo(configDir);
+    if (!accountInfo) throw new Error("Could not read account info from config dir.");
+
+    const backupDir = backupDirFor(CLAUSONA_DIR, options.tool, options.name);
+    await rm(backupDir, { force: true, recursive: true });
+    await mkdir(backupDir, { recursive: true });
+    // Per-item backup happens inside setupSharedLinks; no need to copy the full dir.
+    const mergeSessions = options.mergeSessions ?? false;
+    try {
+      if (mergeSessions && options.tool === "claude") {
+        await mergeSessionFiles(configDir, primarySource);
+      }
+      await setupSharedLinks(adapter, configDir, primarySource, mergeSessions, backupDir);
+      if (options.tool === "claude") {
+        await mergePluginFiles(path.join(configDir, "plugins"), path.join(primarySource, "plugins"));
+        await setupPluginsDir(configDir, primarySource);
+      }
+    } catch (error) {
+      await cleanupProfile(options.name, { tool: options.tool, configDir, email: "", isPrimary: false }).catch(
+        () => {},
+      );
+      throw new Error(
+        `Failed to set up profile '${options.name}': ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    registry.profiles[id] = {
+      tool: options.tool,
+      configDir,
+      email: accountInfo.email,
+      orgName: accountInfo.orgName,
+      mergeSessions,
+    };
+    if (!registry.primarySources[options.tool]) {
+      registry.primarySources[options.tool] = primarySource;
+    }
+    await saveRegistry(registry);
+    if (options.tool === "claude") await seedSeenSessions(id, configDir);
+    return { name: options.name, email: accountInfo.email, configDir, backupDir };
   }
 
-  const profile = registry.profiles[name];
-  if (profile.isPrimary) {
-    throw new Error("Cannot remove the primary profile.");
+  // New profile with no --from: create a fresh config dir and run login
+  const dirSuffix = options.tool === "claude" ? ".claude" : ".codex";
+  const configDir = path.join(home, `${dirSuffix}-${options.name}`);
+  if (await exists(configDir)) {
+    throw new Error(
+      `${configDir.replace(home, "~")} already exists. Use --from ${configDir.replace(home, "~")} to import it instead.`,
+    );
+  }
+  await mkdir(configDir, { recursive: true });
+
+  // Check if credentials already exist for this dir
+  let alreadyAuthenticated = false;
+  if (options.tool === "claude") {
+    const resolvedDir = await realpath(configDir).catch(() => configDir);
+    const service = adapter.keychainServiceName?.({ homeDir: home, configDir: resolvedDir });
+    const existing = service && adapter.hasKeychainCredential ? await adapter.hasKeychainCredential(service) : false;
+    const existingAccount = await adapter.readAccountInfo(configDir);
+    alreadyAuthenticated = !!(existingAccount && existing);
+  } else {
+    const existingAccount = await adapter.readAccountInfo(configDir);
+    alreadyAuthenticated = !!existingAccount;
   }
 
+  if (!alreadyAuthenticated) {
+    const loggedIn = await adapter.runLogin(configDir);
+    if (!loggedIn) {
+      await rm(configDir, { force: true, recursive: true });
+      throw new Error(`${options.tool} login failed.`);
+    }
+  }
+
+  // Merge onboarding state for Claude (skip for codex — no equivalent)
+  if (options.tool === "claude") {
+    const primaryJsonPath = claudeJsonPathForConfigDir({ homeDir: home, configDir: primarySource });
+    const jsonPath = path.join(configDir, ".claude.json");
+    const primaryJson = await readJson<Record<string, unknown>>(primaryJsonPath, {});
+    const profileJson = await readJson<Record<string, unknown>>(jsonPath, {});
+    const onboardingKeys = ["hasCompletedOnboarding", "lastOnboardingVersion"] as const;
+    let needsWrite = false;
+    for (const key of onboardingKeys) {
+      if (primaryJson[key] !== undefined && profileJson[key] === undefined) {
+        profileJson[key] = primaryJson[key];
+        needsWrite = true;
+      }
+    }
+    if (needsWrite) await writeJson(jsonPath, profileJson);
+  }
+
+  const accountInfo = await adapter.readAccountInfo(configDir);
+  if (!accountInfo) {
+    await rm(configDir, { force: true, recursive: true });
+    throw new Error("Login succeeded but account metadata is missing.");
+  }
+
+  const backupDir = backupDirFor(CLAUSONA_DIR, options.tool, options.name);
+  await rm(backupDir, { force: true, recursive: true });
+  await mkdir(backupDir, { recursive: true });
+  // Per-item backup happens inside setupSharedLinks; no need to copy the full dir.
+
+  const mergeSessions = options.mergeSessions ?? false;
+  try {
+    await setupSharedLinks(adapter, configDir, primarySource, mergeSessions, backupDir);
+    if (options.tool === "claude") {
+      await setupPluginsDir(configDir, primarySource);
+    }
+  } catch (error) {
+    await cleanupProfile(options.name, { tool: options.tool, configDir, email: "", isPrimary: false }).catch(() => {});
+    await rm(configDir, { force: true, recursive: true }).catch(() => {});
+    throw new Error(
+      `Failed to set up profile '${options.name}': ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  registry.profiles[id] = {
+    tool: options.tool,
+    configDir,
+    email: accountInfo.email,
+    orgName: accountInfo.orgName,
+    mergeSessions,
+  };
+  if (!registry.primarySources[options.tool]) {
+    registry.primarySources[options.tool] = primarySource;
+  }
+  await saveRegistry(registry);
+  if (options.tool === "claude") await seedSeenSessions(id, configDir);
+  return { name: options.name, email: accountInfo.email, configDir };
+}
+
+export async function loginProfile(id: string) {
+  const registry = await loadRegistry();
+  if (!registry?.profiles[id]) throw new Error(`Profile '${id}' not found.`);
+  const profile = registry.profiles[id];
+  const loggedIn = await getAdapter(profile.tool).runLogin(profile.configDir);
+  if (!loggedIn) throw new Error(`${profile.tool} login failed.`);
+  return profile;
+}
+
+export async function removeProfile(id: string) {
+  const registry = await loadRegistry();
+  if (!registry?.profiles[id]) throw new Error(`Profile '${id}' not found.`);
+
+  const profile = registry.profiles[id];
+  if (profile.isPrimary) throw new Error("Cannot remove the primary profile.");
+
+  const name = id.split(":").slice(1).join(":");
   await cleanupProfile(name, profile);
 
-  delete registry.profiles[name];
-  if (registry.activeProfile === name) {
-    registry.activeProfile = Object.keys(registry.profiles)[0] ?? "";
+  delete registry.profiles[id];
+  // If the removed profile was the active one for its tool, pick another or clear
+  if (registry.activeProfiles[profile.tool] === id) {
+    const otherKey = Object.keys(registry.profiles).find((k) => registry.profiles[k].tool === profile.tool);
+    if (otherKey) {
+      registry.activeProfiles[profile.tool] = otherKey;
+    } else {
+      delete registry.activeProfiles[profile.tool];
+    }
+  }
+  // Clean primarySources if no profile of this tool remains
+  const anyLeftForTool = Object.values(registry.profiles).some((p) => p.tool === profile.tool);
+  if (!anyLeftForTool) {
+    delete registry.primarySources[profile.tool];
   }
   await saveRegistry(registry);
 }
 
-export async function resolveProfileEnv(name: string): Promise<{ configDir: string; env: NodeJS.ProcessEnv }> {
+export async function resolveProfileEnv(
+  id: string,
+): Promise<{ tool: ToolName; binary: string; configDir: string; env: NodeJS.ProcessEnv }> {
   const registry = await loadRegistry();
-  if (!registry?.profiles[name]) {
-    throw new Error(`Profile '${name}' not found.`);
-  }
-
-  const profile = registry.profiles[name];
+  if (!registry?.profiles[id]) throw new Error(`Profile '${id}' not found.`);
+  const profile = registry.profiles[id];
+  const adapter = getAdapter(profile.tool);
   const env = { ...process.env };
-
   if (profile.isPrimary) {
-    delete env.CLAUDE_CONFIG_DIR;
+    delete env[adapter.configEnvVar];
   } else {
-    env.CLAUDE_CONFIG_DIR = profile.configDir;
+    env[adapter.configEnvVar] = profile.configDir;
   }
-
-  await syncPluginsJson(profile.configDir, registry.primarySource).catch(() => {});
-
-  return { configDir: profile.configDir, env };
+  if (profile.tool === "claude") {
+    const primary = registry.primarySources.claude ?? adapter.defaultConfigDir(homedir());
+    await syncPluginsJson(profile.configDir, primary).catch((e) =>
+      warn(`syncPluginsJson: ${e instanceof Error ? e.message : String(e)}`),
+    );
+  }
+  return { tool: profile.tool, binary: adapter.binary, configDir: profile.configDir, env };
 }
 
 export function shellInit() {
@@ -1135,13 +1261,14 @@ export async function uninstallClausona() {
   // 1. Strip symlinks, restore backups for all non-primary profiles
   const registry = await loadRegistry();
   if (registry) {
-    for (const [name, profile] of Object.entries(registry.profiles)) {
+    for (const [id, profile] of Object.entries(registry.profiles)) {
       if (profile.isPrimary) continue;
       try {
+        const name = id.split(":").slice(1).join(":");
         await cleanupProfile(name, profile);
-        removed.push(`profile: ${name} (symlinks stripped, data preserved at ${profile.configDir.replace(home, "~")})`);
-      } catch {
-        // best-effort
+        removed.push(`profile: ${id} (symlinks stripped, data preserved at ${profile.configDir.replace(home, "~")})`);
+      } catch (e) {
+        warn(`uninstall: could not clean up profile ${id}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   }

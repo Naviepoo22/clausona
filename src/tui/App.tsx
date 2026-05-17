@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { bootstrapInitFromCurrentState } from "../commands.js";
 import { formatCount, formatCurrency, localTimezoneLabel } from "../lib/format.js";
+import { profileId } from "../lib/profile-ref.js";
 import {
   addProfile,
   discoverAccounts,
@@ -20,7 +21,7 @@ import {
   updateProfileConfig,
   validateConfigDir,
 } from "../lib/service.js";
-import type { DiscoveredAccount, DoctorProfileResult, ProfileListItem } from "../types.js";
+import type { DiscoveredAccount, DoctorProfileResult, ProfileListItem, ToolName } from "../types.js";
 import { Chrome } from "./components/Chrome.js";
 import { Divider } from "./components/Divider.js";
 import { ProfilePreview } from "./components/ProfilePreview.js";
@@ -56,6 +57,7 @@ type AddStep =
   | "method"
   | "discover-select"
   | "discover-name"
+  | "login-tool"
   | "login-name"
   | "import-path"
   | "import-name"
@@ -72,11 +74,12 @@ type AddState = {
   nameIndex: number;
   importPath: string;
   importError: string | null;
-  importAccount: { configDir: string; email: string; orgName?: string } | null;
+  importAccount: { configDir: string; email: string; orgName?: string; tool: ToolName } | null;
   cursor: number;
   mergeSessions: boolean;
   mergeSessionsMap: Record<string, boolean>;
   nameField: 0 | 1;
+  selectedTool: import("../types.js").ToolName;
   message?: string;
 };
 
@@ -227,6 +230,7 @@ export function App({ initialScreen = "dashboard" }: AppProps) {
       mergeSessions: false,
       mergeSessionsMap: {},
       nameField: 0,
+      selectedTool: "claude",
     });
     try {
       const discovered = await discoverAccounts();
@@ -361,12 +365,12 @@ export function App({ initialScreen = "dashboard" }: AppProps) {
       if (screen === "use" && addState) {
         if (addState.step === "method" || addState.step === "done" || addState.step === "error") {
           resetAddState();
-        } else if (
-          addState.step === "discover-select" ||
-          addState.step === "login-name" ||
-          addState.step === "import-path"
-        ) {
+        } else if (addState.step === "login-tool") {
           setAddState((prev) => (prev ? { ...prev, step: "method", cursor: 0 } : null));
+        } else if (addState.step === "discover-select" || addState.step === "import-path") {
+          setAddState((prev) => (prev ? { ...prev, step: "method", cursor: 0 } : null));
+        } else if (addState.step === "login-name") {
+          setAddState((prev) => (prev ? { ...prev, step: "login-tool", cursor: 0 } : null));
         } else if (addState.step === "discover-name") {
           setAddState((prev) => (prev ? { ...prev, step: "discover-select", cursor: 0 } : null));
         } else if (addState.step === "import-name") {
@@ -482,7 +486,7 @@ export function App({ initialScreen = "dashboard" }: AppProps) {
                 );
               }
             } else if (selected === "login") {
-              setAddState((prev) => (prev ? { ...prev, step: "login-name", nameDraft: "" } : null));
+              setAddState((prev) => (prev ? { ...prev, step: "login-tool", cursor: 0 } : null));
             } else if (selected === "import") {
               setAddState((prev) =>
                 prev ? { ...prev, step: "import-path", importPath: "", importError: null } : null,
@@ -568,7 +572,13 @@ export function App({ initialScreen = "dashboard" }: AppProps) {
           if (!currentDir) return;
           const trimmed = addState.nameDraft.trim() || "profile";
           // Check for duplicate name
-          if (profiles.some((p) => p.name === trimmed) || Object.values(addState.profileNames).includes(trimmed)) {
+          const currentAccount = addState.discoveredAccounts.find((a) => a.configDir === currentDir);
+          const currentTool = currentAccount?.tool ?? "claude";
+          const newDiscoverId = profileId(currentTool, trimmed);
+          if (
+            profiles.some((p) => p.name === newDiscoverId) ||
+            Object.values(addState.profileNames).includes(trimmed)
+          ) {
             setAddState((prev) => (prev ? { ...prev, message: `Profile "${trimmed}" already exists` } : null));
             return;
           }
@@ -581,7 +591,9 @@ export function App({ initialScreen = "dashboard" }: AppProps) {
               try {
                 for (const [dir, name] of Object.entries(nextNames)) {
                   const merge = addState.mergeSessionsMap[dir] || undefined;
-                  await addProfile({ name, fromPath: dir, mergeSessions: merge });
+                  const account = addState.discoveredAccounts.find((a) => a.configDir === dir);
+                  const tool = account?.tool ?? "claude";
+                  await addProfile({ tool, name, fromPath: dir, mergeSessions: merge });
                 }
                 setAddState((prev) =>
                   prev ? { ...prev, step: "done", message: `Added ${Object.keys(nextNames).length} profile(s)` } : null,
@@ -617,11 +629,26 @@ export function App({ initialScreen = "dashboard" }: AppProps) {
           return;
         }
 
+        // Login tool picker
+        if (addState.step === "login-tool") {
+          const tools = ["claude", "codex"] as const;
+          if (key.upArrow) {
+            setAddState((prev) => (prev ? { ...prev, cursor: (prev.cursor - 1 + tools.length) % tools.length } : null));
+          } else if (key.downArrow) {
+            setAddState((prev) => (prev ? { ...prev, cursor: (prev.cursor + 1) % tools.length } : null));
+          } else if (key.return) {
+            const tool = tools[addState.cursor];
+            setAddState((prev) => (prev ? { ...prev, selectedTool: tool, step: "login-name", nameDraft: "" } : null));
+          }
+          return;
+        }
+
         // Login name
         if (addState.step === "login-name" && key.return) {
           const name = addState.nameDraft.trim();
           if (!name) return;
-          if (profiles.some((p) => p.name === name)) {
+          const newLoginId = profileId(addState.selectedTool, name);
+          if (profiles.some((p) => p.name === newLoginId)) {
             setAddState((prev) => (prev ? { ...prev, message: `Profile "${name}" already exists` } : null));
             return;
           }
@@ -629,7 +656,7 @@ export function App({ initialScreen = "dashboard" }: AppProps) {
           void (async () => {
             try {
               const result = await suspendTuiAndRun(() =>
-                addProfile({ name, mergeSessions: addState.mergeSessions || undefined }),
+                addProfile({ tool: addState.selectedTool, name, mergeSessions: addState.mergeSessions || undefined }),
               );
               setAddState((prev) =>
                 prev ? { ...prev, step: "done", message: `Added ${result.name} (${result.email})` } : null,
@@ -679,7 +706,8 @@ export function App({ initialScreen = "dashboard" }: AppProps) {
         if (addState.step === "import-name" && key.return) {
           const name = addState.nameDraft.trim();
           if (!name || !addState.importAccount) return;
-          if (profiles.some((p) => p.name === name)) {
+          const newImportId = profileId(addState.importAccount.tool, name);
+          if (profiles.some((p) => p.name === newImportId)) {
             setAddState((prev) => (prev ? { ...prev, message: `Profile "${name}" already exists` } : null));
             return;
           }
@@ -687,6 +715,7 @@ export function App({ initialScreen = "dashboard" }: AppProps) {
           void (async () => {
             try {
               const result = await addProfile({
+                tool: addState.importAccount?.tool ?? "claude",
                 name,
                 fromPath: addState.importAccount?.configDir,
                 mergeSessions: addState.mergeSessions || undefined,
@@ -1185,6 +1214,25 @@ export function App({ initialScreen = "dashboard" }: AppProps) {
         );
       }
 
+      if (addState.step === "login-tool") {
+        const tools = ["claude", "codex"] as const;
+        return (
+          <Chrome title="Add Profile" subtitle="Choose tool" hints={selectHints}>
+            <Box flexDirection="column" borderStyle="round" borderColor={color.dim} paddingX={2} paddingY={1}>
+              <SelectList
+                items={tools.map((tool, i) => ({
+                  id: tool,
+                  label: tool,
+                  detail: tool === "claude" ? "Claude by Anthropic" : "Codex by OpenAI",
+                  selected: i === addState.cursor,
+                }))}
+                index={addState.cursor}
+              />
+            </Box>
+          </Chrome>
+        );
+      }
+
       if (addState.step === "login-name") {
         return (
           <Chrome title="Add Profile" subtitle="Login as new account" hints={initNameHints}>
@@ -1666,7 +1714,11 @@ export function App({ initialScreen = "dashboard" }: AppProps) {
     return (
       <Chrome title="Initialize" hints={[]}>
         <Spinner
-          label={initState.step === "loading" ? "Scanning for Claude accounts..." : "Writing registry and symlinks..."}
+          label={
+            initState.step === "loading"
+              ? "Scanning for Claude and Codex accounts..."
+              : "Writing registry and symlinks..."
+          }
         />
       </Chrome>
     );
@@ -1706,7 +1758,7 @@ export function App({ initialScreen = "dashboard" }: AppProps) {
               multi
               items={initState.accounts.map((account) => ({
                 id: account.configDir,
-                label: account.configDir.replace(homedir(), "~"),
+                label: `[${account.tool}] ${account.configDir.replace(homedir(), "~")}`,
                 detail: account.email,
                 selected: initState.selected.includes(account.configDir),
               }))}

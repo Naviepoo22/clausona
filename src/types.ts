@@ -14,7 +14,10 @@ export type UsageSummary = {
   outputTokens: number;
 };
 
+export type ToolName = "claude" | "codex";
+
 export type Profile = {
+  tool: ToolName;
   configDir: string;
   email: string;
   orgName?: string;
@@ -23,12 +26,29 @@ export type Profile = {
 };
 
 export type Registry = {
-  primarySource: string;
-  activeProfile: string;
+  version: 2;
+  primarySources: Partial<Record<ToolName, string>>;
+  activeProfiles: Partial<Record<ToolName, string>>;
   profiles: Record<string, Profile>;
 };
 
+export type RegistryV1 = {
+  primarySource: string;
+  activeProfile: string;
+  profiles: Record<
+    string,
+    {
+      configDir: string;
+      email: string;
+      orgName?: string;
+      isPrimary?: boolean;
+      mergeSessions?: boolean;
+    }
+  >;
+};
+
 export type DiscoveredAccount = {
+  tool: ToolName;
   configDir: string;
   jsonPath: string;
   email: string;
@@ -39,6 +59,7 @@ export type DiscoveredAccount = {
 
 export type ProfileListItem = {
   name: string;
+  tool: ToolName;
   email: string;
   orgName?: string;
   configDir: string;

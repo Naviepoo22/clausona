@@ -1,4 +1,4 @@
-import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Registry, UsageStore } from "../types.js";
@@ -19,7 +19,9 @@ async function readJson<T>(targetPath: string, fallback: T): Promise<T> {
 
 async function writeJson(targetPath: string, value: unknown) {
   await mkdir(path.dirname(targetPath), { recursive: true });
-  await writeFile(targetPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const tmpPath = `${targetPath}.tmp.${process.pid}`;
+  await writeFile(tmpPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await rename(tmpPath, targetPath);
 }
 
 /**
@@ -31,7 +33,7 @@ export async function trackUsage(profileName?: string): Promise<void> {
   const registry = await readJson<Registry | null>(REGISTRY_PATH, null);
   if (!registry) return;
 
-  const name = profileName ?? registry.activeProfile;
+  const name = profileName ?? registry.activeProfiles?.claude ?? registry.activeProfiles?.codex;
   if (!name || !registry.profiles[name]) return;
 
   const profile = registry.profiles[name];
