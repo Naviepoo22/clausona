@@ -1,9 +1,10 @@
-import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 
 import { claudeJsonPathForConfigDir } from "../core/paths.js";
+import { spawnCommand } from "../core/process.js";
 import type { ToolAdapter } from "./types.js";
 
 const BASE_SHARED_LINK_SKIP = new Set([".claude.json", "image-cache", "statsig", "plugins"]);
@@ -18,14 +19,14 @@ function keychainService(args: { homeDir: string; configDir: string }): string {
 async function hasKeychain(service: string): Promise<boolean> {
   if (process.platform !== "darwin") return false;
   return new Promise<boolean>((resolve) => {
-    const child = spawn("security", ["find-generic-password", "-s", service], { stdio: "ignore" });
+    const child = spawnCommand("security", ["find-generic-password", "-s", service], { stdio: "ignore" });
     child.on("close", (code) => resolve(code === 0));
     child.on("error", () => resolve(false));
   });
 }
 
 async function readAccount(configDir: string): Promise<{ email: string; orgName?: string } | null> {
-  const jsonPath = claudeJsonPathForConfigDir({ homeDir: process.env.HOME ?? "", configDir });
+  const jsonPath = claudeJsonPathForConfigDir({ homeDir: homedir(), configDir });
   try {
     const raw = await readFile(jsonPath, "utf8");
     const parsed = JSON.parse(raw) as { oauthAccount?: { emailAddress?: string; organizationName?: string } };
@@ -39,7 +40,7 @@ async function readAccount(configDir: string): Promise<{ email: string; orgName?
 
 async function runLoginInteractive(configDir: string): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
-    const child = spawn("claude", ["auth", "login"], {
+    const child = spawnCommand("claude", ["auth", "login"], {
       env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
       stdio: "inherit",
     });

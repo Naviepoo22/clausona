@@ -1,7 +1,6 @@
-import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-
+import { spawnCommand } from "../core/process.js";
 import { decodeJwtPayload } from "./codex-jwt.js";
 import type { AccountInfo, ToolAdapter } from "./types.js";
 
@@ -83,7 +82,7 @@ async function readCodexAccount(configDir: string): Promise<AccountInfo | null> 
 
 async function runCodexLogin(configDir: string): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
-    const child = spawn("codex", ["login"], {
+    const child = spawnCommand("codex", ["login"], {
       env: { ...process.env, CODEX_HOME: configDir },
       stdio: "inherit",
     });

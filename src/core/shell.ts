@@ -1,4 +1,4 @@
-export function renderShellInit() {
+export function renderPosixShellInit() {
   return `# clausona shell integration
 _clausona_resolve() {
   local tool=$1
@@ -76,4 +76,89 @@ codex() {
 
 alias csn=clausona
 `;
+}
+
+export function renderPowerShellInit() {
+  return `# clausona PowerShell integration
+function global:Get-ClausonaProfileDir {
+  param([Parameter(Mandatory = $true)][ValidateSet("claude", "codex")][string]$Tool)
+
+  $profilesPath = Join-Path $HOME ".clausona\\profiles.json"
+  if (-not (Test-Path -LiteralPath $profilesPath)) { return }
+
+  try {
+    $registry = Get-Content -LiteralPath $profilesPath -Raw | ConvertFrom-Json
+    $activeId = $registry.activeProfiles.$Tool
+    if (-not $activeId) { return }
+    $profile = $registry.profiles.PSObject.Properties[$activeId].Value
+    if (-not $profile) { return }
+    if ($profile.isPrimary -eq $true) {
+      return "__PRIMARY__"
+    }
+    return $profile.configDir
+  } catch {
+    return
+  }
+}
+
+function global:claude {
+  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+
+  $hadConfig = Test-Path Env:CLAUDE_CONFIG_DIR
+  $previousConfig = $env:CLAUDE_CONFIG_DIR
+  if (-not $hadConfig) {
+    $resolved = Get-ClausonaProfileDir -Tool claude
+    if ($resolved -and $resolved -ne "__PRIMARY__") {
+      $env:CLAUDE_CONFIG_DIR = $resolved
+    }
+  }
+
+  try {
+    clausona _sync-plugins *> $null
+    $command = Get-Command claude -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    & $command.Source @Arguments
+    $exitCode = $LASTEXITCODE
+    clausona _track-usage *> $null
+    $global:LASTEXITCODE = $exitCode
+  } finally {
+    if ($hadConfig) {
+      $env:CLAUDE_CONFIG_DIR = $previousConfig
+    } else {
+      Remove-Item Env:CLAUDE_CONFIG_DIR -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+function global:codex {
+  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+
+  $hadConfig = Test-Path Env:CODEX_HOME
+  $previousConfig = $env:CODEX_HOME
+  if (-not $hadConfig) {
+    $resolved = Get-ClausonaProfileDir -Tool codex
+    if ($resolved -and $resolved -ne "__PRIMARY__") {
+      $env:CODEX_HOME = $resolved
+    }
+  }
+
+  try {
+    $command = Get-Command codex -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    & $command.Source @Arguments
+    $exitCode = $LASTEXITCODE
+    $global:LASTEXITCODE = $exitCode
+  } finally {
+    if ($hadConfig) {
+      $env:CODEX_HOME = $previousConfig
+    } else {
+      Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+Set-Alias -Name csn -Value clausona -Scope Global
+`;
+}
+
+export function renderShellInit(platform: NodeJS.Platform = process.platform) {
+  return platform === "win32" ? renderPowerShellInit() : renderPosixShellInit();
 }
