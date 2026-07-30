@@ -716,6 +716,35 @@ export async function setActiveProfileByName(id: string) {
   return next.profiles[id];
 }
 
+export async function renameProfile(id: string, newLabel: string) {
+  const registry = await loadRegistry();
+  if (!registry?.profiles[id]) throw new Error(`Profile '${id}' not found.`);
+  if (newLabel === "" || newLabel.includes(":")) {
+    throw new Error("New profile label must be non-empty and cannot contain ':'.");
+  }
+
+  const profile = registry.profiles[id];
+  const newId = profileId(profile.tool, newLabel);
+  if (newId === id) return { oldId: id, newId, changed: false };
+  if (registry.profiles[newId]) throw new Error(`Profile '${newId}' already exists.`);
+
+  const usage = await loadUsageStore();
+  if (usage[newId]) throw new Error(`Usage data for '${newId}' already exists.`);
+  if (usage[id]) {
+    usage[newId] = usage[id];
+    delete usage[id];
+    await writeJson(USAGE_PATH, usage);
+  }
+
+  registry.profiles[newId] = profile;
+  delete registry.profiles[id];
+  if (registry.activeProfiles[profile.tool] === id) {
+    registry.activeProfiles[profile.tool] = newId;
+  }
+  await saveRegistry(registry);
+  return { oldId: id, newId, changed: true };
+}
+
 export async function getUsageSummary(profileId_: string | null, period: UsagePeriod) {
   const registry = await loadRegistry();
   if (!registry) {
