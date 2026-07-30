@@ -8,7 +8,7 @@ import { spawnCommand } from "../core/process.js";
 import { isV1Registry, migrateRegistryV1toV2, setActiveProfile } from "../core/registry.js";
 import { createSharedLink, inspectSharedLink } from "../core/shared-links.js";
 import { renderShellInit } from "../core/shell.js";
-import { seedSeenSessions } from "../core/track-usage.js";
+import { seedProfileUsage } from "../core/track-usage.js";
 import { summarizeUsage } from "../core/usage.js";
 import { allAdapters, getAdapter } from "../tools/registry.js";
 import type { ToolAdapter } from "../tools/types.js";
@@ -665,13 +665,11 @@ export async function initializeRegistry(options: {
   await saveRegistry(registry);
   await writeJson(USAGE_PATH, {});
 
-  // Seed seenSessions for each registered profile (claude only — codex usage tracking is v1 OOS)
+  // Seed current usage so initialization never imports historical activity.
   for (const account of options.accounts) {
     const baseName = options.profileNames[account.configDir] ?? defaultProfileNameForConfigDir(account.configDir);
     const id = profileId(account.tool, baseName);
-    if (account.tool === "claude") {
-      await seedSeenSessions(id, account.configDir);
-    }
+    await seedProfileUsage(id, account.tool, account.configDir);
   }
 
   return registry;
@@ -1113,7 +1111,7 @@ export async function addProfile(options: {
       registry.primarySources[options.tool] = primarySource;
     }
     await saveRegistry(registry);
-    if (options.tool === "claude") await seedSeenSessions(id, configDir);
+    await seedProfileUsage(id, options.tool, configDir);
     return { name: options.name, email: accountInfo.email, configDir, backupDir };
   }
 
@@ -1204,7 +1202,7 @@ export async function addProfile(options: {
     registry.primarySources[options.tool] = primarySource;
   }
   await saveRegistry(registry);
-  if (options.tool === "claude") await seedSeenSessions(id, configDir);
+  await seedProfileUsage(id, options.tool, configDir);
   return { name: options.name, email: accountInfo.email, configDir };
 }
 
