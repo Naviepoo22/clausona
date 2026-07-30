@@ -12,6 +12,7 @@ vi.mock("node:os", async (importOriginal) => {
 });
 
 import { trackUsage } from "./track-usage.js";
+import { runCommand } from "../commands.js";
 
 const clausonaDir = path.join(testState.home, ".clausona");
 const usagePath = path.join(clausonaDir, "usage.json");
@@ -186,6 +187,44 @@ describe("trackUsage for Codex", () => {
         records: [],
         codexSessions: {
           "2026/07/30/rollout-work.jsonl": { inputTokens: 70, outputTokens: 8 },
+        },
+      },
+    });
+  });
+
+  it("routes the internal Codex tracking command instead of falling back to active Claude", async () => {
+    await writeRegistry({
+      "claude:default": {
+        tool: "claude",
+        configDir: path.join(testState.home, ".claude"),
+        email: "claude@example.com",
+        isPrimary: true,
+      },
+      "codex:default": {
+        tool: "codex",
+        configDir: codexDefaultDir,
+        email: "codex@example.com",
+        isPrimary: true,
+      },
+    });
+    const registry = JSON.parse(
+      await readFile(path.join(clausonaDir, "profiles.json"), "utf8"),
+    ) as Record<string, any>;
+    registry.activeProfiles = { claude: "claude:default", codex: "codex:default" };
+    await writeFile(
+      path.join(clausonaDir, "profiles.json"),
+      `${JSON.stringify(registry)}\n`,
+      "utf8",
+    );
+    await writeSession(codexDefaultDir, "rollout-codex.jsonl", 90, 9);
+
+    await runCommand("_track-usage", ["codex"]);
+
+    expect(await readUsage()).toEqual({
+      "codex:default": {
+        records: [],
+        codexSessions: {
+          "2026/07/30/rollout-codex.jsonl": { inputTokens: 90, outputTokens: 9 },
         },
       },
     });

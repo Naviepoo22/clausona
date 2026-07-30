@@ -22,9 +22,21 @@ describe("renderShellInit", () => {
     expect(out).toMatch(/_clausona_resolve codex/);
   });
 
-  it("does NOT include _track-usage in codex wrapper (claude only in v1)", () => {
+  it("tracks Codex usage after the command and before restoring CODEX_HOME", () => {
     const codexBlock = out.split(/^codex\(\)\s*\{/m)[1] ?? "";
-    expect(codexBlock).not.toMatch(/_track-usage/);
+    const commandIndex = codexBlock.indexOf('command codex "$@"');
+    const trackingIndex = codexBlock.indexOf("clausona _track-usage codex");
+    const restoreIndex = codexBlock.indexOf('export CODEX_HOME="$previous_codex_home"');
+    expect(commandIndex).toBeGreaterThanOrEqual(0);
+    expect(trackingIndex).toBeGreaterThan(commandIndex);
+    expect(restoreIndex).toBeGreaterThan(trackingIndex);
+  });
+
+  it("restores a CODEX_HOME value that existed before the wrapper ran", () => {
+    const codexBlock = out.split(/^codex\(\)\s*\{/m)[1] ?? "";
+    expect(codexBlock).toMatch(/local had_codex_home=0/);
+    expect(codexBlock).toMatch(/local previous_codex_home="\$\{CODEX_HOME:-\}"/);
+    expect(codexBlock).toMatch(/export CODEX_HOME="\$previous_codex_home"/);
   });
 
   it("retains csn alias", () => {
@@ -67,5 +79,13 @@ describe("renderPowerShellInit", () => {
     expect(out).toMatch(/\$previousConfig = \$env:CLAUDE_CONFIG_DIR/);
     expect(out).toMatch(/\$env:CLAUDE_CONFIG_DIR = \$previousConfig/);
     expect(out).toMatch(/Set-Alias -Name csn -Value clausona -Scope Global/);
+  });
+
+  it("tracks Codex before finally restores CODEX_HOME and preserves its exit code", () => {
+    const codexBlock = out.split("function global:codex")[1] ?? "";
+    expect(codexBlock).toMatch(
+      /& \$command\.Source @Arguments\s+\$exitCode = \$LASTEXITCODE\s+clausona _track-usage codex \*>\s*\$null\s+\$global:LASTEXITCODE = \$exitCode\s+} finally \{/,
+    );
+    expect(codexBlock).toMatch(/\$env:CODEX_HOME = \$previousConfig|Remove-Item Env:CODEX_HOME/);
   });
 });

@@ -574,7 +574,7 @@ export async function runCommand(command: string, args: string[]) {
     }
 
     case "_track-usage": {
-      await trackUsage();
+      await trackUsage(args[0]);
       return "";
     }
 

@@ -59,6 +59,11 @@ claude() {
 
 unalias codex 2>/dev/null
 codex() {
+  local had_codex_home=0
+  local previous_codex_home="\${CODEX_HOME:-}"
+  if [[ -n "\${CODEX_HOME+x}" ]]; then
+    had_codex_home=1
+  fi
   if [[ -z "\${CODEX_HOME:-}" ]]; then
     local r
     r=$(_clausona_resolve codex)
@@ -70,7 +75,12 @@ codex() {
   fi
   command codex "$@"
   local rc=$?
-  unset CODEX_HOME
+  clausona _track-usage codex 2>/dev/null
+  if [[ $had_codex_home -eq 1 ]]; then
+    export CODEX_HOME="$previous_codex_home"
+  else
+    unset CODEX_HOME
+  fi
   return $rc
 }
 
@@ -145,6 +155,7 @@ function global:codex {
     $command = Get-Command codex -CommandType Application -ErrorAction Stop | Select-Object -First 1
     & $command.Source @Arguments
     $exitCode = $LASTEXITCODE
+    clausona _track-usage codex *> $null
     $global:LASTEXITCODE = $exitCode
   } finally {
     if ($hadConfig) {

@@ -31,6 +31,16 @@ export function parseCommand(argv: string[]): ParsedCommand {
 
 const TUI_SCREENS = new Set(["dashboard", "use", "doctor", "init"]);
 
+export async function executeProfileRun(profile: string, args: string[]): Promise<number> {
+  const registry = await loadRegistry();
+  if (!registry) throw new Error("clausona is not initialized.");
+  const ref = parseProfileRef(profile, registry);
+  const { binary, env } = await resolveProfileEnv(ref.id);
+  const result = spawnCommandSync(binary, args, { stdio: "inherit", env });
+  await trackUsage(ref.id).catch(() => {});
+  return result.status ?? 1;
+}
+
 async function main() {
   const parsed = parseCommand(process.argv.slice(2));
 
@@ -63,15 +73,7 @@ async function main() {
 
   if (parsed.kind === "exec") {
     try {
-      const registry = await loadRegistry();
-      if (!registry) throw new Error("clausona is not initialized.");
-      const ref = parseProfileRef(parsed.profile, registry);
-      const { binary, env } = await resolveProfileEnv(ref.id);
-      const result = spawnCommandSync(binary, parsed.args, { stdio: "inherit", env });
-      process.exitCode = result.status ?? 1;
-      if (ref.tool === "claude") {
-        await trackUsage(ref.id).catch(() => {});
-      }
+      process.exitCode = await executeProfileRun(parsed.profile, parsed.args);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       process.stderr.write(`  ${xMark} ${message}\n`);
