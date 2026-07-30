@@ -450,9 +450,6 @@ export async function runCommand(command: string, args: string[]) {
         const registry = await loadRegistry();
         if (!registry) throw new Error("clausona is not initialized.");
         const ref = parseProfileRef(input, registry);
-        if (ref.tool === "codex") {
-          throw new Error("Usage tracking not supported for codex (yet).");
-        }
         id = ref.id;
       }
 

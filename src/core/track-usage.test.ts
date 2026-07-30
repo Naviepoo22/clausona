@@ -229,4 +229,33 @@ describe("trackUsage for Codex", () => {
       },
     });
   });
+
+  it("returns Codex token summaries through the public usage command", async () => {
+    await writeFile(
+      usagePath,
+      `${JSON.stringify({
+        "codex:default": {
+          records: [
+            {
+              ts: "2026-07-30T08:00:00+08:00",
+              tz: "+08:00",
+              cost: 0,
+              inputTokens: 1200,
+              outputTokens: 75,
+            },
+          ],
+          codexSessions: {},
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    const output = await runCommand("usage", ["codex:default", "--period=all", "--json"]);
+
+    expect(JSON.parse(output)).toEqual({
+      cost: 0,
+      inputTokens: 1200,
+      outputTokens: 75,
+    });
+  });
 });

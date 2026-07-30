@@ -65,32 +65,17 @@ export function renderList(items: ProfileListItem[]) {
   const headerLine = `    ${cols.map((c) => secondary(c.label.padEnd(c.w))).join("")}`;
   const sep = `    ${dimmer("─".repeat(cols.reduce((s, c) => s + c.w, 0)))}`;
 
-  const hasCodex = sorted.some((item) => item.tool === "codex");
-
   const rows = sorted.map((item) => {
     const marker = item.isActive ? accent("▸") : " ";
     const name = item.isActive ? pad(accent(item.name), cols[0].w) : item.name.padEnd(cols[0].w);
     const email = pad(item.isActive ? item.email : secondary(item.email), cols[1].w);
-    let cost: string;
-    let input: string;
-    let output: string;
-    if (item.tool === "codex") {
-      cost = pad(dim("—"), cols[2].w);
-      input = pad(dim("—"), cols[3].w);
-      output = `${dim("—")}  *`;
-    } else {
-      cost = pad(styledCost(item.week.cost), cols[2].w);
-      input = pad(styledCount(item.week.inputTokens), cols[3].w);
-      output = styledCount(item.week.outputTokens);
-    }
+    const cost = pad(styledCost(item.week.cost), cols[2].w);
+    const input = pad(styledCount(item.week.inputTokens), cols[3].w);
+    const output = styledCount(item.week.outputTokens);
     return `  ${marker} ${name}${email}${cost}${input}${output}`;
   });
 
-  const footnote = hasCodex ? [`  ${dim("* usage tracking not supported for codex")}`] : [];
-
-  return ["", `  ${dim(range)}  ${dim(localTimezoneLabel())}`, "", headerLine, sep, ...rows, ...footnote, ""].join(
-    "\n",
-  );
+  return ["", `  ${dim(range)}  ${dim(localTimezoneLabel())}`, "", headerLine, sep, ...rows, ""].join("\n");
 }
 
 // ─── Usage Summary ──────────────────────────────────────────────────
