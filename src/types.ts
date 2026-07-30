@@ -12,11 +12,25 @@ export type UsageSummary = {
   cost: number;
   inputTokens: number;
   outputTokens: number;
+  rateLimits?: CodexRateLimits;
 };
 
 export type CodexSessionCursor = {
   inputTokens: number;
   outputTokens: number;
+};
+
+export type CodexRateLimitWindow = {
+  usedPercent: number;
+  windowMinutes: number;
+  resetsAt: number;
+};
+
+export type CodexRateLimits = {
+  observedAt: string;
+  planType?: string;
+  primary?: CodexRateLimitWindow;
+  secondary?: CodexRateLimitWindow;
 };
 
 export type ToolName = "claude" | "codex";
@@ -71,6 +85,7 @@ export type ProfileListItem = {
   isPrimary: boolean;
   isActive: boolean;
   mergeSessions?: boolean;
+  rateLimits?: CodexRateLimits;
   today: UsageSummary;
   week: UsageSummary;
   month: UsageSummary;
@@ -104,6 +119,7 @@ export type UsageStore = Record<
     records: UsageRecord[];
     seenSessions?: Record<string, string>;
     codexSessions?: Record<string, CodexSessionCursor>;
+    codexRateLimits?: CodexRateLimits;
   }
 >;
 

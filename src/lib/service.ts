@@ -695,6 +695,7 @@ export async function listProfiles(): Promise<ProfileListItem[]> {
       isPrimary: Boolean(profile.isPrimary),
       isActive: registry.activeProfiles[profile.tool] === id,
       mergeSessions: profile.mergeSessions,
+      rateLimits: profile.tool === "codex" ? usage[id]?.codexRateLimits : undefined,
       today: summarizeUsage({ now, period: "today", records }),
       week: summarizeUsage({ now, period: "week", records }),
       month: summarizeUsage({ now, period: "month", records }),
@@ -754,13 +755,22 @@ export async function getUsageSummary(profileId_: string | null, period: UsagePe
 
   if (profileId_) {
     const records = usage[profileId_]?.records ?? [];
-    return summarizeUsage({ now, period, records });
+    const summary = summarizeUsage({ now, period, records });
+    const profile = registry.profiles[profileId_];
+    return profile?.tool === "codex" && usage[profileId_]?.codexRateLimits
+      ? { ...summary, rateLimits: usage[profileId_].codexRateLimits }
+      : summary;
   }
 
   return Object.fromEntries(
     Object.keys(registry.profiles).map((id) => [
       id,
-      summarizeUsage({ now, period, records: usage[id]?.records ?? [] }),
+      {
+        ...summarizeUsage({ now, period, records: usage[id]?.records ?? [] }),
+        ...(registry.profiles[id].tool === "codex" && usage[id]?.codexRateLimits
+          ? { rateLimits: usage[id].codexRateLimits }
+          : {}),
+      },
     ]),
   );
 }

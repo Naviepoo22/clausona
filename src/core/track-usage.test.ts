@@ -18,9 +18,14 @@ const clausonaDir = path.join(testState.home, ".clausona");
 const usagePath = path.join(clausonaDir, "usage.json");
 const codexDefaultDir = path.join(testState.home, ".codex");
 
-function tokenEvent(inputTokens: number, outputTokens: number) {
+function tokenEvent(
+  inputTokens: number,
+  outputTokens: number,
+  rateLimits: unknown = null,
+  timestamp = "2026-07-30T03:36:22.278Z",
+) {
   return `${JSON.stringify({
-    timestamp: "2026-07-30T03:36:22.278Z",
+    timestamp,
     type: "event_msg",
     payload: {
       type: "token_count",
@@ -33,7 +38,7 @@ function tokenEvent(inputTokens: number, outputTokens: number) {
           total_tokens: inputTokens + outputTokens,
         },
       },
-      rate_limits: null,
+      rate_limits: rateLimits,
     },
   })}\n`;
 }
@@ -86,6 +91,59 @@ afterEach(async () => {
 });
 
 describe("trackUsage for Codex", () => {
+  it("stores the latest provider limits without creating a token record", async () => {
+    const file = await writeSession(codexDefaultDir, "rollout-a.jsonl", 100, 10);
+    await appendFile(
+      file,
+      tokenEvent(
+        100,
+        10,
+        {
+          plan_type: "plus",
+          primary: { used_percent: 66, window_minutes: 300, resets_at: 1_754_000_000 },
+          secondary: { used_percent: 10, window_minutes: 10_080, resets_at: 1_754_500_000 },
+        },
+        "2026-07-30T03:37:22.278Z",
+      ),
+      "utf8",
+    );
+
+    await trackUsage("codex");
+
+    expect((await readUsage())["codex:default"]).toEqual({
+      records: [],
+      codexSessions: {
+        "2026/07/30/rollout-a.jsonl": { inputTokens: 100, outputTokens: 10 },
+      },
+      codexRateLimits: {
+        observedAt: "2026-07-30T03:37:22.278Z",
+        planType: "plus",
+        primary: { usedPercent: 66, windowMinutes: 300, resetsAt: 1_754_000_000 },
+        secondary: { usedPercent: 10, windowMinutes: 10_080, resetsAt: 1_754_500_000 },
+      },
+    });
+  });
+
+  it("clears a previous limit snapshot when the newest session has none", async () => {
+    const first = await writeSession(codexDefaultDir, "rollout-a.jsonl", 100, 10);
+    await appendFile(
+      first,
+      tokenEvent(100, 10, {
+        primary: { used_percent: 66, window_minutes: 300, resets_at: 2_000_000_000 },
+      }),
+      "utf8",
+    );
+    await trackUsage("codex");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await writeSession(codexDefaultDir, "rollout-b.jsonl", 20, 2);
+
+    await trackUsage("codex");
+
+    const profile = (await readUsage())["codex:default"];
+    expect(profile.codexRateLimits).toBeUndefined();
+    expect(profile.records).toEqual([expect.objectContaining({ cost: 0, inputTokens: 20, outputTokens: 2 })]);
+  });
+
   it("establishes a first-pass baseline without importing existing tokens", async () => {
     await writeSession(codexDefaultDir, "rollout-a.jsonl", 100, 10);
 
@@ -250,6 +308,11 @@ describe("trackUsage for Codex", () => {
             },
           ],
           codexSessions: {},
+          codexRateLimits: {
+            observedAt: "2026-07-30T03:37:22.278Z",
+            primary: { usedPercent: 66, windowMinutes: 300, resetsAt: 1_754_000_000 },
+            secondary: { usedPercent: 10, windowMinutes: 10_080, resetsAt: 1_754_500_000 },
+          },
         },
       })}\n`,
       "utf8",
@@ -261,6 +324,11 @@ describe("trackUsage for Codex", () => {
       cost: 0,
       inputTokens: 1200,
       outputTokens: 75,
+      rateLimits: {
+        observedAt: "2026-07-30T03:37:22.278Z",
+        primary: { usedPercent: 66, windowMinutes: 300, resetsAt: 1_754_000_000 },
+        secondary: { usedPercent: 10, windowMinutes: 10_080, resetsAt: 1_754_500_000 },
+      },
     });
   });
 });

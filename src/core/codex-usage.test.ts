@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { readCodexSessionTotals, readLatestCodexTokenTotals } from "./codex-usage.js";
+import { readCodexSessionTotals, readCodexSessionUsage, readLatestCodexTokenTotals } from "./codex-usage.js";
 
 const tempDirs: string[] = [];
 
@@ -12,9 +12,14 @@ async function makeTempDir() {
   return dir;
 }
 
-function tokenEvent(inputTokens: unknown, outputTokens: unknown) {
+function tokenEvent(
+  inputTokens: unknown,
+  outputTokens: unknown,
+  rateLimits: unknown = null,
+  timestamp = "2026-07-30T03:36:22.278Z",
+) {
   return JSON.stringify({
-    timestamp: "2026-07-30T03:36:22.278Z",
+    timestamp,
     type: "event_msg",
     payload: {
       type: "token_count",
@@ -27,7 +32,7 @@ function tokenEvent(inputTokens: unknown, outputTokens: unknown) {
           total_tokens: 999,
         },
       },
-      rate_limits: null,
+      rate_limits: rateLimits,
     },
   });
 }
@@ -111,5 +116,62 @@ describe("readCodexSessionTotals", () => {
     const configDir = await makeTempDir();
 
     await expect(readCodexSessionTotals(configDir)).resolves.toEqual({});
+  });
+});
+
+describe("readCodexSessionUsage", () => {
+  it("returns the newest valid provider rate-limit snapshot alongside session totals", async () => {
+    const configDir = await makeTempDir();
+    const dayDir = path.join(configDir, "sessions", "2026", "07", "30");
+    await mkdir(dayDir, { recursive: true });
+    const rateLimits = {
+      plan_type: "plus",
+      primary: { used_percent: 66, window_minutes: 300, resets_at: 1_754_000_000 },
+      secondary: { used_percent: 10, window_minutes: 10_080, resets_at: 1_754_500_000 },
+    };
+    await writeFile(
+      path.join(dayDir, "rollout-a.jsonl"),
+      [
+        tokenEvent(80, 12, rateLimits, "2026-07-30T03:36:22.278Z"),
+        tokenEvent(90, 14, null, "2026-07-30T03:37:22.278Z"),
+      ].join("\n"),
+      "utf8",
+    );
+
+    await expect(readCodexSessionUsage(configDir)).resolves.toEqual({
+      sessions: {
+        "2026/07/30/rollout-a.jsonl": { inputTokens: 90, outputTokens: 14 },
+      },
+      rateLimits: {
+        observedAt: "2026-07-30T03:36:22.278Z",
+        planType: "plus",
+        primary: { usedPercent: 66, windowMinutes: 300, resetsAt: 1_754_000_000 },
+        secondary: { usedPercent: 10, windowMinutes: 10_080, resetsAt: 1_754_500_000 },
+      },
+    });
+  });
+
+  it("rejects an implausibly future provider timestamp", async () => {
+    const configDir = await makeTempDir();
+    const dayDir = path.join(configDir, "sessions", "2026", "07", "30");
+    await mkdir(dayDir, { recursive: true });
+    await writeFile(
+      path.join(dayDir, "rollout-a.jsonl"),
+      tokenEvent(
+        80,
+        12,
+        {
+          primary: { used_percent: 66, window_minutes: 300, resets_at: 2_000_000_000 },
+        },
+        "2099-07-30T03:36:22.278Z",
+      ),
+      "utf8",
+    );
+
+    await expect(readCodexSessionUsage(configDir)).resolves.toEqual({
+      sessions: {
+        "2026/07/30/rollout-a.jsonl": { inputTokens: 80, outputTokens: 12 },
+      },
+    });
   });
 });

@@ -2,7 +2,7 @@ import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Registry, ToolName, UsageStore } from "../types.js";
-import { readCodexSessionTotals } from "./codex-usage.js";
+import { readCodexSessionUsage } from "./codex-usage.js";
 import { claudeJsonPathForConfigDir } from "./paths.js";
 
 const CLAUSONA_DIR = path.join(homedir(), ".clausona");
@@ -116,20 +116,26 @@ async function trackClaude(profileId: string, configDir: string, usage: UsageSto
 }
 
 async function trackCodex(profileId: string, configDir: string, usage: UsageStore) {
-  const current = await readCodexSessionTotals(configDir);
+  const current = await readCodexSessionUsage(configDir);
   usage[profileId] ??= { records: [] };
   const profileUsage = usage[profileId];
 
   if (profileUsage.codexSessions === undefined) {
-    profileUsage.codexSessions = current;
+    profileUsage.codexSessions = current.sessions;
+    profileUsage.codexRateLimits = current.rateLimits;
     return true;
   }
 
   let inputTokens = 0;
   let outputTokens = 0;
   let changed = false;
+  if (JSON.stringify(current.rateLimits) !== JSON.stringify(profileUsage.codexRateLimits)) {
+    if (current.rateLimits) profileUsage.codexRateLimits = current.rateLimits;
+    else delete profileUsage.codexRateLimits;
+    changed = true;
+  }
 
-  for (const [sessionPath, totals] of Object.entries(current)) {
+  for (const [sessionPath, totals] of Object.entries(current.sessions)) {
     const previous = profileUsage.codexSessions[sessionPath];
     if (previous && (totals.inputTokens < previous.inputTokens || totals.outputTokens < previous.outputTokens)) {
       profileUsage.codexSessions[sessionPath] = totals;
@@ -194,7 +200,9 @@ export async function seedProfileUsage(profileId: string, tool: ToolName, config
   usage[profileId] ??= { records: [] };
 
   if (tool === "codex") {
-    usage[profileId].codexSessions = await readCodexSessionTotals(configDir);
+    const current = await readCodexSessionUsage(configDir);
+    usage[profileId].codexSessions = current.sessions;
+    usage[profileId].codexRateLimits = current.rateLimits;
     await writeJson(USAGE_PATH, usage);
     return;
   }

@@ -1,5 +1,11 @@
 import { symbol } from "../tui/theme.js";
-import type { DoctorProfileResult, ProfileListItem, UsageSummary } from "../types.js";
+import type {
+  CodexRateLimits,
+  CodexRateLimitWindow,
+  DoctorProfileResult,
+  ProfileListItem,
+  UsageSummary,
+} from "../types.js";
 
 import {
   accent,
@@ -40,6 +46,29 @@ export function formatUsage(summary: UsageSummary) {
   return `${formatCurrency(summary.cost)} | in ${formatCount(summary.inputTokens)} | out ${formatCount(summary.outputTokens)}`;
 }
 
+function rateLimitWindowLabel(windowMinutes: number) {
+  if (windowMinutes % (24 * 60) === 0) return `${windowMinutes / (24 * 60)}d`;
+  if (windowMinutes % 60 === 0) return `${windowMinutes / 60}h`;
+  return `${windowMinutes}m`;
+}
+
+function remainingPercent(window: CodexRateLimitWindow) {
+  return Math.max(0, 100 - window.usedPercent);
+}
+
+function formatRemainingPercent(window: CodexRateLimitWindow) {
+  if (Date.now() >= window.resetsAt * 1000) return "—";
+  return `${remainingPercent(window).toLocaleString("en-US", { maximumFractionDigits: 1 })}%`;
+}
+
+function formatRateLimits(rateLimits?: CodexRateLimits) {
+  if (!rateLimits) return "—";
+  return [rateLimits.primary, rateLimits.secondary]
+    .filter((window): window is CodexRateLimitWindow => Boolean(window))
+    .map((window) => `${rateLimitWindowLabel(window.windowMinutes)} ${formatRemainingPercent(window)}`)
+    .join(" · ");
+}
+
 // ─── List ───────────────────────────────────────────────────────────
 export function renderList(items: ProfileListItem[]) {
   const now = new Date();
@@ -60,7 +89,8 @@ export function renderList(items: ProfileListItem[]) {
     { label: "ACCOUNT", w: 32 },
     { label: "COST", w: 12 },
     { label: "INPUT", w: 14 },
-    { label: "OUTPUT", w: 10 },
+    { label: "OUTPUT", w: 12 },
+    { label: "REMAINING", w: 22 },
   ];
   const headerLine = `    ${cols.map((c) => secondary(c.label.padEnd(c.w))).join("")}`;
   const sep = `    ${dimmer("─".repeat(cols.reduce((s, c) => s + c.w, 0)))}`;
@@ -71,8 +101,9 @@ export function renderList(items: ProfileListItem[]) {
     const email = pad(item.isActive ? item.email : secondary(item.email), cols[1].w);
     const cost = pad(styledCost(item.week.cost), cols[2].w);
     const input = pad(styledCount(item.week.inputTokens), cols[3].w);
-    const output = styledCount(item.week.outputTokens);
-    return `  ${marker} ${name}${email}${cost}${input}${output}`;
+    const output = pad(styledCount(item.week.outputTokens), cols[4].w);
+    const remaining = item.tool === "codex" ? formatRateLimits(item.rateLimits) : "—";
+    return `  ${marker} ${name}${email}${cost}${input}${output}${remaining}`;
   });
 
   return ["", `  ${dim(range)}  ${dim(localTimezoneLabel())}`, "", headerLine, sep, ...rows, ""].join("\n");
@@ -98,6 +129,16 @@ export function renderUsageSummary(
       `    ${secondary("Cost".padEnd(16))}${styledCost(s.cost)}`,
       `    ${secondary("Input tokens".padEnd(16))}${styledCount(s.inputTokens)}`,
       `    ${secondary("Output tokens".padEnd(16))}${styledCount(s.outputTokens)}`,
+      ...(s.rateLimits?.primary
+        ? [
+            `    ${secondary(`${rateLimitWindowLabel(s.rateLimits.primary.windowMinutes)} remaining`.padEnd(16))}${formatRemainingPercent(s.rateLimits.primary)}`,
+          ]
+        : []),
+      ...(s.rateLimits?.secondary
+        ? [
+            `    ${secondary(`${rateLimitWindowLabel(s.rateLimits.secondary.windowMinutes)} remaining`.padEnd(16))}${formatRemainingPercent(s.rateLimits.secondary)}`,
+          ]
+        : []),
       "",
     ].join("\n");
   }
@@ -109,19 +150,20 @@ export function renderUsageSummary(
     { label: "COST", w: 14 },
     { label: "INPUT", w: 14 },
     { label: "OUTPUT", w: 14 },
+    { label: "REMAINING", w: 22 },
   ];
   const headerLine = `    ${cols.map((c) => secondary(c.label.padEnd(c.w))).join("")}`;
   const sep = `    ${dimmer("─".repeat(cols.reduce((s, c) => s + c.w, 0)))}`;
 
   const rows = Object.entries(entries).map(([name, s]) => {
-    return `    ${name.padEnd(cols[0].w)}${pad(styledCost(s.cost), cols[1].w)}${pad(styledCount(s.inputTokens), cols[2].w)}${styledCount(s.outputTokens)}`;
+    return `    ${name.padEnd(cols[0].w)}${pad(styledCost(s.cost), cols[1].w)}${pad(styledCount(s.inputTokens), cols[2].w)}${pad(styledCount(s.outputTokens), cols[3].w)}${formatRateLimits(s.rateLimits)}`;
   });
 
   const totalCost = Object.values(entries).reduce((sum, s) => sum + s.cost, 0);
   const totalIn = Object.values(entries).reduce((sum, s) => sum + s.inputTokens, 0);
   const totalOut = Object.values(entries).reduce((sum, s) => sum + s.outputTokens, 0);
 
-  const totalRow = `    ${pad(bold("Total"), cols[0].w)}${pad(bold(styledCost(totalCost)), cols[1].w)}${pad(styledCount(totalIn), cols[2].w)}${styledCount(totalOut)}`;
+  const totalRow = `    ${pad(bold("Total"), cols[0].w)}${pad(bold(styledCost(totalCost)), cols[1].w)}${pad(styledCount(totalIn), cols[2].w)}${pad(styledCount(totalOut), cols[3].w)}—`;
 
   return [
     "",

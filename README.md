@@ -30,7 +30,7 @@ No re-login. No reinstalling plugins. Just switch and go.
 - **Shared environment** — MCP servers, plugins, permissions, settings (Claude) and config.toml, skills, hooks (Codex) are symlinked across profiles within each tool. Set up once, use everywhere.
 - **Pure CLI passthrough** — no wrapping, no proxying, no background process. `claude` and `codex` run directly and unmodified. Compatible with oh-my-claudecode, Cline, codex plugins, and any other tool in your stack.
 - **Lightweight** — a single shell hook and a few symlinks. No daemon, no server, no runtime overhead.
-- **Usage tracking** — per-profile cost and token usage for Claude, plus input/output tokens for Codex, tracked locally
+- **Usage tracking** — per-profile cost and token usage for Claude, plus input/output tokens and provider-reported remaining capacity for Codex, tracked locally
 - **Interactive dashboard** — TUI for managing profiles, viewing usage, and running health checks
 
 ## Install
@@ -97,7 +97,7 @@ Shell wrappers for `claude` and `codex` are registered via `eval "$(clausona she
 `Invoke-Expression (& clausona shell-init | Out-String)` on PowerShell:
 
 1. **Before** each invocation — reads `~/.clausona/profiles.json` and sets the appropriate env var (`CLAUDE_CONFIG_DIR` for claude, `CODEX_HOME` for codex) to the active profile's config directory
-2. **After** each invocation — records new Claude cost/tokens or Codex input/output token deltas for the profile that ran
+2. **After** each invocation — records new Claude cost/tokens or Codex input/output token deltas and rolling-window limits for the profile that ran
 
 ```
 clausona use work
@@ -110,13 +110,15 @@ clausona use codex:personal
 ↓
 codex              ← wrapper sets CODEX_HOME, then runs codex
 ↓
-_track-usage       ← on exit, records new input/output tokens
+_track-usage       ← on exit, records tokens and remaining 5-hour/7-day capacity
 ```
 
 Codex tracking starts from the first baseline created by this version; existing
 session history is not imported. Codex session logs do not expose a reliable
 dollar cost, so Codex cost remains unavailable. Cached input is included in the
 input-token total; cached-input and reasoning-token breakouts are not shown.
+When Codex reports rolling limits, `clausona list` and `clausona usage` show the
+remaining percentage for its 5-hour and 7-day windows.
 
 ### Shared Environment
 
