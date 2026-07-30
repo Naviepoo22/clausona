@@ -62,6 +62,7 @@ clausona use work         # switch to a profile (bare name if unique)
 clausona use claude:work  # switch claude account (use prefix when both tools have "work")
 clausona add codex:work   # add a codex profile
 clausona use codex:personal  # switch codex account
+clausona rename claude:default personal  # rename a profile label
 clausona list             # see all profiles with weekly usage
 clausona                  # open the interactive dashboard
 ```
@@ -76,6 +77,7 @@ clausona                  # open the interactive dashboard
 | `clausona init`                                                     | Discover and register Claude Code and Codex accounts |
 | `clausona add <profile> [--from <path>] [--merge-sessions]`         | Add a profile manually                               |
 | `clausona remove <profile>`                                         | Remove a profile                                     |
+| `clausona rename <profile> <new-label>`                             | Rename a profile label without moving its data       |
 | `clausona use [profile]`                                            | Switch active profile                                |
 | `clausona run <profile> [-- args...]`                               | Run the tool's CLI with a specific profile           |
 | `clausona list [--json]`                                            | List all profiles with usage                         |

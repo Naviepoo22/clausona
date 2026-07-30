@@ -64,3 +64,18 @@ describe("--period validation (F4)", () => {
     }
   });
 });
+
+describe("rename command", () => {
+  it("documents the rename command", async () => {
+    expect(await runCommand("help", [])).toContain("rename <profile> <new-label>");
+    expect(await runCommand("rename", ["--help"])).toContain("clausona rename <existing-profile> <new-label>");
+  });
+
+  it.each([
+    { args: [] },
+    { args: ["claude:default"] },
+    { args: ["claude:default", "personal", "extra"] },
+  ])("rejects invalid arguments: $args", async ({ args }) => {
+    await expect(runCommand("rename", args)).rejects.toThrow("Usage: clausona rename <existing-profile> <new-label>");
+  });
+});
