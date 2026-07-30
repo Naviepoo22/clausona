@@ -80,9 +80,12 @@ async function trackClaude(profileId: string, configDir: string, usage: UsageSto
   const projects = await claudeProjects(configDir);
   if (!projects) return false;
   usage[profileId] ??= { records: [], seenSessions: {} };
-  usage[profileId].seenSessions ??= {};
   const profileUsage = usage[profileId];
-  const seen = profileUsage.seenSessions;
+  let seen = profileUsage.seenSessions;
+  if (!seen) {
+    seen = {};
+    profileUsage.seenSessions = seen;
+  }
   const { ts, tz } = timestamp();
   let changed = false;
 
@@ -127,10 +130,7 @@ async function trackCodex(profileId: string, configDir: string, usage: UsageStor
 
   for (const [sessionPath, totals] of Object.entries(current)) {
     const previous = profileUsage.codexSessions[sessionPath];
-    if (
-      previous &&
-      (totals.inputTokens < previous.inputTokens || totals.outputTokens < previous.outputTokens)
-    ) {
+    if (previous && (totals.inputTokens < previous.inputTokens || totals.outputTokens < previous.outputTokens)) {
       profileUsage.codexSessions[sessionPath] = totals;
       changed = true;
       continue;
@@ -142,11 +142,7 @@ async function trackCodex(profileId: string, configDir: string, usage: UsageStor
       inputTokens += inputDelta;
       outputTokens += outputDelta;
     }
-    if (
-      !previous ||
-      totals.inputTokens !== previous.inputTokens ||
-      totals.outputTokens !== previous.outputTokens
-    ) {
+    if (!previous || totals.inputTokens !== previous.inputTokens || totals.outputTokens !== previous.outputTokens) {
       profileUsage.codexSessions[sessionPath] = totals;
       changed = true;
     }
@@ -192,11 +188,7 @@ function buildFingerprint(projData: Record<string, unknown>): string | null {
   return `${sid}:${cost}:${inputTokens}:${outputTokens}:${duration}`;
 }
 
-export async function seedProfileUsage(
-  profileId: string,
-  tool: ToolName,
-  configDir: string,
-): Promise<void> {
+export async function seedProfileUsage(profileId: string, tool: ToolName, configDir: string): Promise<void> {
   const usage = await readJson<UsageStore>(USAGE_PATH, {});
   usage[profileId] ??= { records: [] };
 
@@ -208,8 +200,11 @@ export async function seedProfileUsage(
 
   const projects = await claudeProjects(configDir);
   if (!projects) return;
-  usage[profileId].seenSessions ??= {};
-  const seen = usage[profileId].seenSessions;
+  let seen = usage[profileId].seenSessions;
+  if (!seen) {
+    seen = {};
+    usage[profileId].seenSessions = seen;
+  }
 
   let changed = false;
   for (const [projPath, projData] of Object.entries(projects)) {

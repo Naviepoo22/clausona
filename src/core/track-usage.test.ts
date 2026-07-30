@@ -11,8 +11,8 @@ vi.mock("node:os", async (importOriginal) => {
   return { ...actual, homedir: () => testState.home };
 });
 
-import { trackUsage } from "./track-usage.js";
 import { runCommand } from "../commands.js";
+import { trackUsage } from "./track-usage.js";
 
 const clausonaDir = path.join(testState.home, ".clausona");
 const usagePath = path.join(clausonaDir, "usage.json");
@@ -207,15 +207,9 @@ describe("trackUsage for Codex", () => {
         isPrimary: true,
       },
     });
-    const registry = JSON.parse(
-      await readFile(path.join(clausonaDir, "profiles.json"), "utf8"),
-    ) as Record<string, any>;
+    const registry = JSON.parse(await readFile(path.join(clausonaDir, "profiles.json"), "utf8")) as Record<string, any>;
     registry.activeProfiles = { claude: "claude:default", codex: "codex:default" };
-    await writeFile(
-      path.join(clausonaDir, "profiles.json"),
-      `${JSON.stringify(registry)}\n`,
-      "utf8",
-    );
+    await writeFile(path.join(clausonaDir, "profiles.json"), `${JSON.stringify(registry)}\n`, "utf8");
     await writeSession(codexDefaultDir, "rollout-codex.jsonl", 90, 9);
 
     await runCommand("_track-usage", ["codex"]);

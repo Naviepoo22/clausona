@@ -1,4 +1,4 @@
-import { open, readdir } from "node:fs/promises";
+import { type FileHandle, open, readdir } from "node:fs/promises";
 import path from "node:path";
 
 export type CodexTokenTotals = {
@@ -48,7 +48,7 @@ function parseTokenTotals(line: string): CodexTokenTotals | null {
 }
 
 export async function readLatestCodexTokenTotals(filePath: string): Promise<CodexTokenTotals | null> {
-  let handle;
+  let handle: FileHandle | undefined;
   try {
     handle = await open(filePath, "r");
     const { size } = await handle.stat();
@@ -56,9 +56,9 @@ export async function readLatestCodexTokenTotals(filePath: string): Promise<Code
 
     while (tailBytes > 0) {
       const start = size - tailBytes;
-      const buffer = Buffer.alloc(tailBytes);
+      const buffer = new Uint8Array(tailBytes);
       const { bytesRead } = await handle.read(buffer, 0, tailBytes, start);
-      let text = buffer.subarray(0, bytesRead).toString("utf8");
+      let text = new TextDecoder().decode(buffer.subarray(0, bytesRead));
 
       if (start > 0) {
         const firstNewline = text.indexOf("\n");
@@ -87,12 +87,7 @@ async function findSessionFiles(root: string): Promise<string[]> {
   const files: string[] = [];
 
   async function visit(dir: string): Promise<void> {
-    let entries;
-    try {
-      entries = await readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
 
     await Promise.all(
       entries.map(async (entry) => {
