@@ -12,7 +12,7 @@ export type UsageSummary = {
   cost: number;
   inputTokens: number;
   outputTokens: number;
-  rateLimits?: CodexRateLimits;
+  rateLimits?: UsageRateLimits;
 };
 
 export type CodexSessionCursor = {
@@ -20,18 +20,21 @@ export type CodexSessionCursor = {
   outputTokens: number;
 };
 
-export type CodexRateLimitWindow = {
+export type UsageRateLimitWindow = {
   usedPercent: number;
   windowMinutes: number;
   resetsAt: number;
 };
 
-export type CodexRateLimits = {
+export type UsageRateLimits = {
   observedAt: string;
   planType?: string;
-  primary?: CodexRateLimitWindow;
-  secondary?: CodexRateLimitWindow;
+  primary?: UsageRateLimitWindow;
+  secondary?: UsageRateLimitWindow;
 };
+
+export type CodexRateLimitWindow = UsageRateLimitWindow;
+export type CodexRateLimits = UsageRateLimits;
 
 export type ToolName = "claude" | "codex";
 
@@ -85,7 +88,7 @@ export type ProfileListItem = {
   isPrimary: boolean;
   isActive: boolean;
   mergeSessions?: boolean;
-  rateLimits?: CodexRateLimits;
+  rateLimits?: UsageRateLimits;
   today: UsageSummary;
   week: UsageSummary;
   month: UsageSummary;
@@ -118,8 +121,9 @@ export type UsageStore = Record<
   {
     records: UsageRecord[];
     seenSessions?: Record<string, string>;
+    claudeRateLimits?: UsageRateLimits;
     codexSessions?: Record<string, CodexSessionCursor>;
-    codexRateLimits?: CodexRateLimits;
+    codexRateLimits?: UsageRateLimits;
   }
 >;
 

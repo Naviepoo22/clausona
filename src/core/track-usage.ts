@@ -2,12 +2,14 @@ import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { Registry, ToolName, UsageStore } from "../types.js";
+import { readClaudeRateLimits } from "./claude-usage.js";
 import { readCodexSessionUsage } from "./codex-usage.js";
 import { claudeJsonPathForConfigDir } from "./paths.js";
 
 const CLAUSONA_DIR = path.join(homedir(), ".clausona");
 const REGISTRY_PATH = path.join(CLAUSONA_DIR, "profiles.json");
 const USAGE_PATH = path.join(CLAUSONA_DIR, "usage.json");
+const CLAUDE_RATE_LIMIT_REFRESH_MS = 5 * 60 * 1_000;
 
 async function readJson<T>(targetPath: string, fallback: T): Promise<T> {
   try {
@@ -78,17 +80,35 @@ function timestamp() {
 }
 
 async function trackClaude(profileId: string, configDir: string, usage: UsageStore) {
-  const projects = await claudeProjects(configDir);
-  if (!projects) return false;
   usage[profileId] ??= { records: [], seenSessions: {} };
   const profileUsage = usage[profileId];
+  const observedAt = profileUsage.claudeRateLimits?.observedAt;
+  const observedAtMs = observedAt ? Date.parse(observedAt) : Number.NaN;
+  const shouldRefreshRateLimits =
+    !Number.isFinite(observedAtMs) || Date.now() - observedAtMs >= CLAUDE_RATE_LIMIT_REFRESH_MS;
+  const [projects, rateLimitRead] = await Promise.all([
+    claudeProjects(configDir),
+    shouldRefreshRateLimits ? readClaudeRateLimits(configDir) : Promise.resolve(null),
+  ]);
+  let changed = false;
+  if (rateLimitRead?.status === "success") {
+    if (rateLimitRead.rateLimits) {
+      if (JSON.stringify(rateLimitRead.rateLimits) !== JSON.stringify(profileUsage.claudeRateLimits)) {
+        profileUsage.claudeRateLimits = rateLimitRead.rateLimits;
+        changed = true;
+      }
+    } else if (profileUsage.claudeRateLimits) {
+      delete profileUsage.claudeRateLimits;
+      changed = true;
+    }
+  }
+  if (!projects) return changed;
   let seen = profileUsage.seenSessions;
   if (!seen) {
     seen = {};
     profileUsage.seenSessions = seen;
   }
   const { ts, tz } = timestamp();
-  let changed = false;
 
   for (const [projPath, projData] of Object.entries(projects)) {
     if (!projData || typeof projData !== "object") continue;
@@ -207,15 +227,29 @@ export async function seedProfileUsage(profileId: string, tool: ToolName, config
     return;
   }
 
-  const projects = await claudeProjects(configDir);
-  if (!projects) return;
+  const [projects, rateLimitRead] = await Promise.all([claudeProjects(configDir), readClaudeRateLimits(configDir)]);
+  let changed = false;
+  if (rateLimitRead.status === "success") {
+    if (rateLimitRead.rateLimits) {
+      if (JSON.stringify(rateLimitRead.rateLimits) !== JSON.stringify(usage[profileId].claudeRateLimits)) {
+        usage[profileId].claudeRateLimits = rateLimitRead.rateLimits;
+        changed = true;
+      }
+    } else if (usage[profileId].claudeRateLimits) {
+      delete usage[profileId].claudeRateLimits;
+      changed = true;
+    }
+  }
+  if (!projects) {
+    if (changed) await writeJson(USAGE_PATH, usage);
+    return;
+  }
   let seen = usage[profileId].seenSessions;
   if (!seen) {
     seen = {};
     usage[profileId].seenSessions = seen;
   }
 
-  let changed = false;
   for (const [projPath, projData] of Object.entries(projects)) {
     if (!projData || typeof projData !== "object") continue;
     const fp = buildFingerprint(projData);

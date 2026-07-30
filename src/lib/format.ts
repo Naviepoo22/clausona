@@ -1,9 +1,9 @@
 import { symbol } from "../tui/theme.js";
 import type {
-  CodexRateLimits,
-  CodexRateLimitWindow,
   DoctorProfileResult,
   ProfileListItem,
+  UsageRateLimits,
+  UsageRateLimitWindow,
   UsageSummary,
 } from "../types.js";
 
@@ -52,19 +52,19 @@ function rateLimitWindowLabel(windowMinutes: number) {
   return `${windowMinutes}m`;
 }
 
-function remainingPercent(window: CodexRateLimitWindow) {
+function remainingPercent(window: UsageRateLimitWindow) {
   return Math.max(0, 100 - window.usedPercent);
 }
 
-function formatRemainingPercent(window: CodexRateLimitWindow) {
+function formatRemainingPercent(window: UsageRateLimitWindow) {
   if (Date.now() >= window.resetsAt * 1000) return "—";
   return `${remainingPercent(window).toLocaleString("en-US", { maximumFractionDigits: 1 })}%`;
 }
 
-function formatRateLimits(rateLimits?: CodexRateLimits) {
+function formatRateLimits(rateLimits?: UsageRateLimits) {
   if (!rateLimits) return "—";
   return [rateLimits.primary, rateLimits.secondary]
-    .filter((window): window is CodexRateLimitWindow => Boolean(window))
+    .filter((window): window is UsageRateLimitWindow => Boolean(window))
     .map((window) => `${rateLimitWindowLabel(window.windowMinutes)} ${formatRemainingPercent(window)}`)
     .join(" · ");
 }
@@ -102,7 +102,7 @@ export function renderList(items: ProfileListItem[]) {
     const cost = pad(styledCost(item.week.cost), cols[2].w);
     const input = pad(styledCount(item.week.inputTokens), cols[3].w);
     const output = pad(styledCount(item.week.outputTokens), cols[4].w);
-    const remaining = item.tool === "codex" ? formatRateLimits(item.rateLimits) : "—";
+    const remaining = formatRateLimits(item.rateLimits);
     return `  ${marker} ${name}${email}${cost}${input}${output}${remaining}`;
   });
 

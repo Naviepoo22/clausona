@@ -34,6 +34,31 @@ describe("renderList", () => {
     expect(output).toContain("7d 90%");
     expect(output).not.toContain("usage tracking not supported for codex");
   });
+
+  it("renders Claude provider limits in the remaining column", () => {
+    const item: ProfileListItem = {
+      name: "claude:work",
+      tool: "claude",
+      email: "work@example.com",
+      configDir: "C:/Users/test/.claude-work",
+      isPrimary: false,
+      isActive: true,
+      rateLimits: {
+        observedAt: "2026-07-30T03:37:22.278Z",
+        primary: { usedPercent: 25, windowMinutes: 300, resetsAt: 2_000_000_000 },
+        secondary: { usedPercent: 40, windowMinutes: 10_080, resetsAt: 2_000_500_000 },
+      },
+      today: emptySummary(),
+      week: emptySummary(),
+      month: emptySummary(),
+      total: emptySummary(),
+    };
+
+    const output = renderList([item]);
+
+    expect(output).toContain("5h 75%");
+    expect(output).toContain("7d 60%");
+  });
 });
 
 describe("renderUsageSummary", () => {

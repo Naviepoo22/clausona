@@ -52,13 +52,17 @@ async function writeRegistry(profiles?: Record<string, object>) {
       isPrimary: true,
     },
   };
+  const [firstId, firstProfile] = Object.entries(registeredProfiles)[0] as [
+    string,
+    { tool: "claude" | "codex"; configDir: string },
+  ];
   await mkdir(clausonaDir, { recursive: true });
   await writeFile(
     path.join(clausonaDir, "profiles.json"),
     `${JSON.stringify({
       version: 2,
-      primarySources: { codex: codexDefaultDir },
-      activeProfiles: { codex: Object.keys(registeredProfiles)[0] },
+      primarySources: { [firstProfile.tool]: firstProfile.configDir },
+      activeProfiles: { [firstProfile.tool]: firstId },
       profiles: registeredProfiles,
     })}\n`,
     "utf8",
@@ -85,9 +89,149 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.unstubAllGlobals();
   delete process.env.CODEX_HOME;
   delete process.env.CLAUDE_CONFIG_DIR;
   await rm(testState.home, { force: true, recursive: true });
+});
+
+describe("trackUsage for Claude", () => {
+  it("stores provider limits without creating a token record", async () => {
+    const claudeDir = path.join(testState.home, ".claude");
+    await writeRegistry({
+      "claude:default": {
+        tool: "claude",
+        configDir: claudeDir,
+        email: "claude@example.com",
+        isPrimary: true,
+      },
+    });
+    await mkdir(claudeDir, { recursive: true });
+    await writeFile(
+      path.join(claudeDir, ".credentials.json"),
+      `${JSON.stringify({ claudeAiOauth: { accessToken: "test-claude-token" } })}\n`,
+      "utf8",
+    );
+    await writeFile(path.join(testState.home, ".claude.json"), `${JSON.stringify({ projects: {} })}\n`, "utf8");
+    const fetchMock = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          five_hour: { utilization: 66, resets_at: "2033-05-18T03:33:20.000Z" },
+          seven_day: { utilization: 10, resets_at: "2033-05-23T22:26:40.000Z" },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await trackUsage("claude");
+    await trackUsage("claude");
+
+    expect((await readUsage())["claude:default"]).toMatchObject({
+      records: [],
+      seenSessions: {},
+      claudeRateLimits: {
+        primary: { usedPercent: 66, windowMinutes: 300, resetsAt: 2_000_000_000 },
+        secondary: { usedPercent: 10, windowMinutes: 10_080, resetsAt: 2_000_500_000 },
+      },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const output = await runCommand("usage", ["claude:default", "--period=all", "--json"]);
+    expect(JSON.parse(output)).toMatchObject({
+      cost: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      rateLimits: {
+        primary: { usedPercent: 66, windowMinutes: 300, resetsAt: 2_000_000_000 },
+        secondary: { usedPercent: 10, windowMinutes: 10_080, resetsAt: 2_000_500_000 },
+      },
+    });
+  });
+
+  it("clears a stale snapshot when a successful refresh reports no valid windows", async () => {
+    const claudeDir = path.join(testState.home, ".claude");
+    await writeRegistry({
+      "claude:default": {
+        tool: "claude",
+        configDir: claudeDir,
+        email: "claude@example.com",
+        isPrimary: true,
+      },
+    });
+    await mkdir(claudeDir, { recursive: true });
+    await writeFile(
+      path.join(claudeDir, ".credentials.json"),
+      `${JSON.stringify({ claudeAiOauth: { accessToken: "test-claude-token" } })}\n`,
+      "utf8",
+    );
+    await writeFile(path.join(testState.home, ".claude.json"), `${JSON.stringify({ projects: {} })}\n`, "utf8");
+    await writeFile(
+      usagePath,
+      `${JSON.stringify({
+        "claude:default": {
+          records: [],
+          seenSessions: {},
+          claudeRateLimits: {
+            observedAt: "2020-01-01T00:00:00.000Z",
+            primary: { usedPercent: 66, windowMinutes: 300, resetsAt: 2_000_000_000 },
+          },
+        },
+      })}\n`,
+      "utf8",
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        return new Response(JSON.stringify({ five_hour: null, seven_day: null }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }),
+    );
+
+    await trackUsage("claude");
+
+    expect((await readUsage())["claude:default"].claudeRateLimits).toBeUndefined();
+  });
+
+  it("retains a stale snapshot when a refresh fails transiently", async () => {
+    const claudeDir = path.join(testState.home, ".claude");
+    await writeRegistry({
+      "claude:default": {
+        tool: "claude",
+        configDir: claudeDir,
+        email: "claude@example.com",
+        isPrimary: true,
+      },
+    });
+    await mkdir(claudeDir, { recursive: true });
+    await writeFile(
+      path.join(claudeDir, ".credentials.json"),
+      `${JSON.stringify({ claudeAiOauth: { accessToken: "test-claude-token" } })}\n`,
+      "utf8",
+    );
+    await writeFile(path.join(testState.home, ".claude.json"), `${JSON.stringify({ projects: {} })}\n`, "utf8");
+    const storedRateLimits = {
+      observedAt: "2020-01-01T00:00:00.000Z",
+      primary: { usedPercent: 66, windowMinutes: 300, resetsAt: 2_000_000_000 },
+    };
+    await writeFile(
+      usagePath,
+      `${JSON.stringify({
+        "claude:default": { records: [], seenSessions: {}, claudeRateLimits: storedRateLimits },
+      })}\n`,
+      "utf8",
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("", { status: 503 })),
+    );
+
+    await trackUsage("claude");
+
+    expect((await readUsage())["claude:default"].claudeRateLimits).toEqual(storedRateLimits);
+  });
 });
 
 describe("trackUsage for Codex", () => {

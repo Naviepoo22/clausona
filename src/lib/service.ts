@@ -33,6 +33,10 @@ const CLAUSONA_DIR = path.join(homedir(), ".clausona");
 const REGISTRY_PATH = path.join(CLAUSONA_DIR, "profiles.json");
 const USAGE_PATH = path.join(CLAUSONA_DIR, "usage.json");
 
+function rateLimitsFor(tool: ToolName, stored: UsageStore[string] | undefined) {
+  return tool === "claude" ? stored?.claudeRateLimits : stored?.codexRateLimits;
+}
+
 async function exists(targetPath: string) {
   try {
     await lstat(targetPath);
@@ -695,7 +699,7 @@ export async function listProfiles(): Promise<ProfileListItem[]> {
       isPrimary: Boolean(profile.isPrimary),
       isActive: registry.activeProfiles[profile.tool] === id,
       mergeSessions: profile.mergeSessions,
-      rateLimits: profile.tool === "codex" ? usage[id]?.codexRateLimits : undefined,
+      rateLimits: rateLimitsFor(profile.tool, usage[id]),
       today: summarizeUsage({ now, period: "today", records }),
       week: summarizeUsage({ now, period: "week", records }),
       month: summarizeUsage({ now, period: "month", records }),
@@ -757,21 +761,21 @@ export async function getUsageSummary(profileId_: string | null, period: UsagePe
     const records = usage[profileId_]?.records ?? [];
     const summary = summarizeUsage({ now, period, records });
     const profile = registry.profiles[profileId_];
-    return profile?.tool === "codex" && usage[profileId_]?.codexRateLimits
-      ? { ...summary, rateLimits: usage[profileId_].codexRateLimits }
-      : summary;
+    const rateLimits = profile ? rateLimitsFor(profile.tool, usage[profileId_]) : undefined;
+    return rateLimits ? { ...summary, rateLimits } : summary;
   }
 
   return Object.fromEntries(
-    Object.keys(registry.profiles).map((id) => [
-      id,
-      {
-        ...summarizeUsage({ now, period, records: usage[id]?.records ?? [] }),
-        ...(registry.profiles[id].tool === "codex" && usage[id]?.codexRateLimits
-          ? { rateLimits: usage[id].codexRateLimits }
-          : {}),
-      },
-    ]),
+    Object.keys(registry.profiles).map((id) => {
+      const rateLimits = rateLimitsFor(registry.profiles[id].tool, usage[id]);
+      return [
+        id,
+        {
+          ...summarizeUsage({ now, period, records: usage[id]?.records ?? [] }),
+          ...(rateLimits ? { rateLimits } : {}),
+        },
+      ];
+    }),
   );
 }
 
