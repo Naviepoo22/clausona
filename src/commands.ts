@@ -15,6 +15,7 @@ import {
   loadRegistry,
   loginProfile,
   removeProfile,
+  renameProfile,
   repairProfile,
   setActiveProfileByName,
   shellInit,
@@ -37,6 +38,7 @@ const commandFlags: Record<string, { flags: string[]; prefixes?: string[] }> = {
   init: { flags: ["--auto", "--merge-sessions"] },
   add: { flags: ["--from", "--merge-sessions"] },
   use: { flags: [] },
+  rename: { flags: [] },
   list: { flags: ["--json"] },
   usage: { flags: ["--json"], prefixes: ["--period="] },
   current: { flags: ["--json"] },
@@ -109,6 +111,20 @@ function subcommandHelpText(command: string): string | undefined {
         "",
         `  ${bold("ARGUMENTS")}`,
         `    ${accent("profile".padEnd(12))}${dim("Profile to switch to (opens TUI picker if omitted)")}`,
+        "",
+      ].join("\n");
+
+    case "rename":
+      return [
+        "",
+        `  ${accent("clausona rename")} ${dim("— Rename a profile label")}`,
+        "",
+        `  ${bold("USAGE")}`,
+        helpUsage("clausona rename <existing-profile> <new-label>"),
+        "",
+        `  ${bold("ARGUMENTS")}`,
+        `    ${accent("existing-profile".padEnd(20))}${dim("Profile to rename")}`,
+        `    ${accent("new-label".padEnd(20))}${dim("New bare label (tool prefix is preserved)")}`,
         "",
       ].join("\n");
 
@@ -297,6 +313,7 @@ function usageText() {
       ["init", "Discover accounts interactively"],
       ["add <profile>", "Add a new profile"],
       ["use [profile]", "Switch active profile"],
+      ["rename <profile> <new-label>", "Rename a profile label"],
       ["list", "Show profiles with usage"],
       ["usage [profile]", "Show usage summary"],
       ["current", "Show active profile details"],
@@ -401,6 +418,19 @@ export async function runCommand(command: string, args: string[]) {
       const ref = parseProfileRef(input, registry);
       const profile = await setActiveProfileByName(ref.id);
       return success(`Switched to ${bold(ref.id)} ${dim(`(${profile.email})`)}`);
+    }
+
+    case "rename": {
+      if (args.length !== 2) {
+        throw new Error("Usage: clausona rename <existing-profile> <new-label>");
+      }
+      const [input, newLabel] = args;
+      const registry = await loadRegistry();
+      if (!registry) throw new Error("clausona is not initialized.");
+      const ref = parseProfileRef(input, registry);
+      const result = await renameProfile(ref.id, newLabel);
+      if (!result.changed) return dim(`${result.oldId} already has label '${newLabel}'`);
+      return success(`Renamed ${bold(result.oldId)} to ${bold(result.newId)}`);
     }
 
     case "usage": {
