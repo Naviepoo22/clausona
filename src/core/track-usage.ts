@@ -1,7 +1,8 @@
 import { mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import type { Registry, UsageStore } from "../types.js";
+import type { Registry, ToolName, UsageStore } from "../types.js";
+import { readCodexSessionTotals } from "./codex-usage.js";
 import { claudeJsonPathForConfigDir } from "./paths.js";
 
 const CLAUSONA_DIR = path.join(homedir(), ".clausona");
@@ -24,54 +25,65 @@ async function writeJson(targetPath: string, value: unknown) {
   await rename(tmpPath, targetPath);
 }
 
-/**
- * Track usage for the given profile (or the active profile if not specified).
- * Reads .claude.json, compares fingerprints to detect new/changed usage,
- * and appends records to usage.json.
- */
-export async function trackUsage(profileName?: string): Promise<void> {
-  const registry = await readJson<Registry | null>(REGISTRY_PATH, null);
-  if (!registry) return;
-
-  const name = profileName ?? registry.activeProfiles?.claude ?? registry.activeProfiles?.codex;
-  if (!name || !registry.profiles[name]) return;
-
-  const profile = registry.profiles[name];
-  const configDir = profile.configDir;
-  if (!configDir) return;
-
-  // Determine .claude.json path
+async function claudeProjects(configDir: string) {
   const home = homedir();
   const defaultClaude = await realpath(path.join(home, ".claude")).catch(() => path.join(home, ".claude"));
   const resolved = await realpath(configDir).catch(() => configDir);
-
   const cjsonPath =
     resolved === defaultClaude
       ? claudeJsonPathForConfigDir({ homeDir: home, configDir: path.join(home, ".claude") })
       : claudeJsonPathForConfigDir({ homeDir: home, configDir });
-
   const cdata = await readJson<Record<string, unknown>>(cjsonPath, {});
-  const projects = cdata.projects as Record<string, Record<string, unknown>> | undefined;
-  if (!projects) return;
+  return cdata.projects as Record<string, Record<string, unknown>> | undefined;
+}
 
-  const usage = await readJson<UsageStore>(USAGE_PATH, {});
+async function normalizedPath(targetPath: string) {
+  const resolved = await realpath(targetPath).catch(() => path.resolve(targetPath));
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
 
-  if (!usage[name]) {
-    usage[name] = { records: [], seenSessions: {} };
+async function resolveProfileId(registry: Registry, target?: string) {
+  if (target && registry.profiles[target]) return target;
+
+  const tool: ToolName | null =
+    target === "claude" || target === "codex"
+      ? target
+      : target
+        ? null
+        : registry.activeProfiles.claude
+          ? "claude"
+          : registry.activeProfiles.codex
+            ? "codex"
+            : null;
+  if (!tool) return null;
+
+  const envDir = tool === "claude" ? process.env.CLAUDE_CONFIG_DIR : process.env.CODEX_HOME;
+  if (envDir) {
+    const wanted = await normalizedPath(envDir);
+    for (const [id, profile] of Object.entries(registry.profiles)) {
+      if (profile.tool === tool && (await normalizedPath(profile.configDir)) === wanted) return id;
+    }
   }
 
-  const prof = usage[name];
-  if (!prof.seenSessions) {
-    prof.seenSessions = {};
-  }
-  const seen = prof.seenSessions;
+  return registry.activeProfiles[tool] ?? null;
+}
 
+function timestamp() {
   const now = new Date();
   const tz = getTimezoneOffset(now);
-  // Format: 2026-03-07T21:00:00+09:00 (matches shell hook's isoformat with seconds precision)
   const pad = (n: number) => String(n).padStart(2, "0");
   const ts = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}${tz}`;
+  return { ts, tz };
+}
 
+async function trackClaude(profileId: string, configDir: string, usage: UsageStore) {
+  const projects = await claudeProjects(configDir);
+  if (!projects) return false;
+  usage[profileId] ??= { records: [], seenSessions: {} };
+  usage[profileId].seenSessions ??= {};
+  const profileUsage = usage[profileId];
+  const seen = profileUsage.seenSessions;
+  const { ts, tz } = timestamp();
   let changed = false;
 
   for (const [projPath, projData] of Object.entries(projects)) {
@@ -86,7 +98,7 @@ export async function trackUsage(profileName?: string): Promise<void> {
     const outputTokens = (projData.lastTotalOutputTokens as number) ?? 0;
 
     seen[projPath] = fp;
-    prof.records.push({
+    profileUsage.records.push({
       ts,
       tz,
       cost: Math.round(cost * 1e6) / 1e6,
@@ -96,6 +108,75 @@ export async function trackUsage(profileName?: string): Promise<void> {
     changed = true;
   }
 
+  return changed;
+}
+
+async function trackCodex(profileId: string, configDir: string, usage: UsageStore) {
+  const current = await readCodexSessionTotals(configDir);
+  usage[profileId] ??= { records: [] };
+  const profileUsage = usage[profileId];
+
+  if (profileUsage.codexSessions === undefined) {
+    profileUsage.codexSessions = current;
+    return true;
+  }
+
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let changed = false;
+
+  for (const [sessionPath, totals] of Object.entries(current)) {
+    const previous = profileUsage.codexSessions[sessionPath];
+    if (
+      previous &&
+      (totals.inputTokens < previous.inputTokens || totals.outputTokens < previous.outputTokens)
+    ) {
+      profileUsage.codexSessions[sessionPath] = totals;
+      changed = true;
+      continue;
+    }
+
+    const inputDelta = totals.inputTokens - (previous?.inputTokens ?? 0);
+    const outputDelta = totals.outputTokens - (previous?.outputTokens ?? 0);
+    if (inputDelta > 0 || outputDelta > 0) {
+      inputTokens += inputDelta;
+      outputTokens += outputDelta;
+    }
+    if (
+      !previous ||
+      totals.inputTokens !== previous.inputTokens ||
+      totals.outputTokens !== previous.outputTokens
+    ) {
+      profileUsage.codexSessions[sessionPath] = totals;
+      changed = true;
+    }
+  }
+
+  if (inputTokens > 0 || outputTokens > 0) {
+    const { ts, tz } = timestamp();
+    profileUsage.records.push({ ts, tz, cost: 0, inputTokens, outputTokens });
+    changed = true;
+  }
+
+  return changed;
+}
+
+/**
+ * Track usage for a qualified profile, tool, or the active Claude-first profile.
+ */
+export async function trackUsage(target?: string): Promise<void> {
+  const registry = await readJson<Registry | null>(REGISTRY_PATH, null);
+  if (!registry) return;
+  const profileId = await resolveProfileId(registry, target);
+  if (!profileId) return;
+  const profile = registry.profiles[profileId];
+  if (!profile?.configDir) return;
+
+  const usage = await readJson<UsageStore>(USAGE_PATH, {});
+  const changed =
+    profile.tool === "codex"
+      ? await trackCodex(profileId, profile.configDir, usage)
+      : await trackClaude(profileId, profile.configDir, usage);
   if (changed) {
     await writeJson(USAGE_PATH, usage);
   }
@@ -111,30 +192,24 @@ function buildFingerprint(projData: Record<string, unknown>): string | null {
   return `${sid}:${cost}:${inputTokens}:${outputTokens}:${duration}`;
 }
 
-/**
- * Seed seenSessions with current fingerprints so that pre-existing usage
- * is not recorded when tracking starts. Call this when initializing or adding a profile.
- */
-export async function seedSeenSessions(profileName: string, configDir: string): Promise<void> {
-  const home = homedir();
-  const defaultClaude = await realpath(path.join(home, ".claude")).catch(() => path.join(home, ".claude"));
-  const resolved = await realpath(configDir).catch(() => configDir);
-
-  const cjsonPath =
-    resolved === defaultClaude
-      ? claudeJsonPathForConfigDir({ homeDir: home, configDir: path.join(home, ".claude") })
-      : claudeJsonPathForConfigDir({ homeDir: home, configDir });
-
-  const cdata = await readJson<Record<string, unknown>>(cjsonPath, {});
-  const projects = cdata.projects as Record<string, Record<string, unknown>> | undefined;
-  if (!projects) return;
-
+export async function seedProfileUsage(
+  profileId: string,
+  tool: ToolName,
+  configDir: string,
+): Promise<void> {
   const usage = await readJson<UsageStore>(USAGE_PATH, {});
-  if (!usage[profileName]) {
-    usage[profileName] = { records: [], seenSessions: {} };
+  usage[profileId] ??= { records: [] };
+
+  if (tool === "codex") {
+    usage[profileId].codexSessions = await readCodexSessionTotals(configDir);
+    await writeJson(USAGE_PATH, usage);
+    return;
   }
-  usage[profileName].seenSessions ??= {};
-  const seen = usage[profileName].seenSessions;
+
+  const projects = await claudeProjects(configDir);
+  if (!projects) return;
+  usage[profileId].seenSessions ??= {};
+  const seen = usage[profileId].seenSessions;
 
   let changed = false;
   for (const [projPath, projData] of Object.entries(projects)) {
@@ -148,6 +223,10 @@ export async function seedSeenSessions(profileName: string, configDir: string): 
   if (changed) {
     await writeJson(USAGE_PATH, usage);
   }
+}
+
+export async function seedSeenSessions(profileName: string, configDir: string): Promise<void> {
+  await seedProfileUsage(profileName, "claude", configDir);
 }
 
 function getTimezoneOffset(date: Date): string {

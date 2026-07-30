@@ -14,6 +14,11 @@ export type UsageSummary = {
   outputTokens: number;
 };
 
+export type CodexSessionCursor = {
+  inputTokens: number;
+  outputTokens: number;
+};
+
 export type ToolName = "claude" | "codex";
 
 export type Profile = {
@@ -98,6 +103,7 @@ export type UsageStore = Record<
   {
     records: UsageRecord[];
     seenSessions?: Record<string, string>;
+    codexSessions?: Record<string, CodexSessionCursor>;
   }
 >;
 
