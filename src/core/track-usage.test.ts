@@ -192,6 +192,17 @@ describe("trackUsage for Codex", () => {
     });
   });
 
+  it("does not attribute an unregistered CODEX_HOME to the active profile", async () => {
+    const externalDir = path.join(testState.home, ".codex-external");
+    process.env.CODEX_HOME = externalDir;
+    await writeSession(externalDir, "rollout-external.jsonl", 70, 8);
+    await writeFile(usagePath, "{}\n", "utf8");
+
+    await trackUsage("codex");
+
+    expect(await readUsage()).toEqual({});
+  });
+
   it("routes the internal Codex tracking command instead of falling back to active Claude", async () => {
     await writeRegistry({
       "claude:default": {

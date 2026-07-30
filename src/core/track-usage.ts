@@ -63,6 +63,7 @@ async function resolveProfileId(registry: Registry, target?: string) {
     for (const [id, profile] of Object.entries(registry.profiles)) {
       if (profile.tool === tool && (await normalizedPath(profile.configDir)) === wanted) return id;
     }
+    return null;
   }
 
   return registry.activeProfiles[tool] ?? null;
