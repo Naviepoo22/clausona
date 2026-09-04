@@ -1,16 +1,30 @@
 import { Box, Text } from "ink";
-import { formatCurrency, localTimezoneLabel } from "../../lib/format.js";
-import type { DoctorProfileResult, ProfileListItem } from "../../types.js";
+import { truncate } from "../../lib/cli-style.js";
+import { fitQuotaValue, formatAge, formatCurrency, localTimezoneLabel } from "../../lib/format.js";
+import type { DoctorProfileResult, ProfileListItem, QuotaSnapshot, QuotaWindow } from "../../types.js";
 import { color, symbol } from "../theme.js";
 
-function Row({ label, value, valueColor }: { label: string; value: string; valueColor?: string }) {
+function Row({
+  label,
+  value,
+  valueColor,
+  singleLine = false,
+}: {
+  label: string;
+  value: string;
+  valueColor?: string;
+  /** Keep the value on one line. Prevents character-by-character wrapping in a narrow panel. */
+  singleLine?: boolean;
+}) {
   return (
     <Box gap={1} width="100%" flexDirection="row">
       <Box width={12} flexShrink={0}>
         <Text color={color.muted}>{label}</Text>
       </Box>
-      <Box flexGrow={1} flexShrink={1}>
-        <Text color={valueColor ?? color.text}>{value}</Text>
+      <Box flexGrow={1} flexShrink={1} minWidth={0} overflow={singleLine ? "hidden" : undefined}>
+        <Text color={valueColor ?? color.text} wrap={singleLine ? "truncate-end" : undefined}>
+          {value}
+        </Text>
       </Box>
     </Box>
   );
@@ -23,6 +37,79 @@ function Separator() {
         <Text color={color.dim}>{symbol.lineH.repeat(300)}</Text>
       </Box>
     </Box>
+  );
+}
+
+const EM_DASH = "\u2014";
+
+const QUOTA_CRITICAL = 90;
+const QUOTA_WARNING = 75;
+
+const QUOTA_STATE_NOTE: Record<Exclude<QuotaSnapshot["state"], "ok">, string> = {
+  expired: "sign-in lapsed \u2014 clausona login",
+  missing: "no stored credential",
+  cooldown: "rate limited, retrying later",
+  error: "lookup failed",
+};
+
+function quotaColor(window: QuotaWindow, live: boolean): string {
+  if (!live) return color.muted;
+  if (window.usedPercent >= QUOTA_CRITICAL) return color.error;
+  if (window.usedPercent >= QUOTA_WARNING) return color.warning;
+  return color.text;
+}
+
+// The detail panel is a fraction of the terminal, and ink gives no width back during
+// render, so the space a Row's value gets is derived from the same layout constants.
+const PREVIEW_PANEL_FRACTION = 0.45; // layout.previewPanelWidth
+const PANEL_CHROME = 10; // outer + inner borders and padding
+const LABEL_COLUMN = 13; // Row's label box plus its gap
+
+function valueWidth(columns: number): number {
+  return Math.max(0, Math.floor(columns * PREVIEW_PANEL_FRACTION) - PANEL_CHROME - LABEL_COLUMN);
+}
+
+function QuotaRow({ label, window, live }: { label: string; window?: QuotaWindow; live: boolean }) {
+  if (!window) {
+    return <Row label={label} value={EM_DASH} valueColor={color.muted} singleLine />;
+  }
+
+  return (
+    <Row
+      label={label}
+      value={fitQuotaValue(window, valueWidth(process.stdout.columns ?? 100))}
+      valueColor={quotaColor(window, live)}
+      singleLine
+    />
+  );
+}
+
+function QuotaSection({ quota }: { quota?: QuotaSnapshot }) {
+  if (!quota) {
+    return <Row label="Quota" value="loading\u2026" valueColor={color.muted} singleLine />;
+  }
+
+  const live = quota.state === "ok";
+  const hasWindows = Boolean(quota.session ?? quota.weekly ?? quota.scoped);
+  return (
+    <>
+      <QuotaRow label="Session" window={quota.session} live={live} />
+      <QuotaRow label="Weekly" window={quota.weekly} live={live} />
+      {quota.scoped && <QuotaRow label={truncate(quota.scoped.label, 12)} window={quota.scoped} live={live} />}
+      {quota.state !== "ok" && (
+        <Row
+          label=""
+          // Numbers shown for a failed lookup are a last-known reading, so say how old.
+          value={
+            hasWindows
+              ? `${QUOTA_STATE_NOTE[quota.state]} \u00b7 ${formatAge(quota.fetchedAt)}`
+              : QUOTA_STATE_NOTE[quota.state]
+          }
+          valueColor={color.warning}
+          singleLine
+        />
+      )}
+    </>
   );
 }
 
@@ -87,6 +174,13 @@ export function ProfilePreview({ profile, doctor }: { profile?: ProfileListItem;
             valueColor={profile.mergeSessions ? color.warning : color.secondary}
           />
         )}
+      </Box>
+
+      <Separator />
+
+      {/* Plan quota */}
+      <Box flexDirection="column" gap={0} marginBottom={1} flexShrink={0}>
+        <QuotaSection quota={profile.quota} />
       </Box>
 
       <Separator />
