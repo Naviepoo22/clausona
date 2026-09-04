@@ -8,8 +8,10 @@ import { renderPowerShellInit, renderShellInit } from "./shell.js";
 
 const ZSH_AVAILABLE = spawnSync("which", ["zsh"]).status === 0;
 
-/** Room for the 10s spawn timeout below plus interpreter startup. */
-const POWERSHELL_TEST_TIMEOUT_MS = 30_000;
+// Two PowerShell cold starts running concurrently on a CI runner took 10s and 22s, so
+// both the spawn budget and the surrounding test budget are sized for contention.
+const POWERSHELL_SPAWN_TIMEOUT_MS = 45_000;
+const POWERSHELL_TEST_TIMEOUT_MS = 60_000;
 const describeIfZsh = ZSH_AVAILABLE ? describe : describe.skip;
 
 function makeTmpDir(): string {
@@ -186,7 +188,7 @@ describeIfPowerShell("PowerShell wrapper integration", () => {
         {
           encoding: "utf8",
           env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` },
-          timeout: 10000,
+          timeout: POWERSHELL_SPAWN_TIMEOUT_MS,
         },
       );
 
