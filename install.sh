@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_NAME="clausona"
-REPO="Naviepoo22/clausona"
+REPO="larcane97/clausona"
 VERSION="${1:-latest}"
 APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/clausona"
 INSTALL_DIR="/usr/local/bin"

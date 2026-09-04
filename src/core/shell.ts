@@ -90,20 +90,20 @@ function global:Get-ClausonaProfileDir {
     $registry = Get-Content -LiteralPath $profilesPath -Raw | ConvertFrom-Json
     $activeId = $registry.activeProfiles.$Tool
     if (-not $activeId) { return }
-    $profile = $registry.profiles.PSObject.Properties[$activeId].Value
-    if (-not $profile) { return }
-    if ($profile.isPrimary -eq $true) {
+    $entry = $registry.profiles.PSObject.Properties[$activeId].Value
+    if (-not $entry) { return }
+    if ($entry.isPrimary -eq $true) {
       return "__PRIMARY__"
     }
-    return $profile.configDir
+    return $entry.configDir
   } catch {
     return
   }
 }
 
 function global:claude {
-  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
-
+  # No param() block on purpose: it would bind arguments that look like parameter
+  # names (-a matches -Arguments) instead of forwarding them. $args forwards verbatim.
   $hadConfig = Test-Path Env:CLAUDE_CONFIG_DIR
   $previousConfig = $env:CLAUDE_CONFIG_DIR
   if (-not $hadConfig) {
@@ -116,7 +116,7 @@ function global:claude {
   try {
     clausona _sync-plugins *> $null
     $command = Get-Command claude -CommandType Application -ErrorAction Stop | Select-Object -First 1
-    & $command.Source @Arguments
+    & $command.Source @args
     $exitCode = $LASTEXITCODE
     clausona _track-usage *> $null
     $global:LASTEXITCODE = $exitCode
@@ -130,8 +130,8 @@ function global:claude {
 }
 
 function global:codex {
-  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
-
+  # No param() block on purpose: it would bind arguments that look like parameter
+  # names (-a matches -Arguments) instead of forwarding them. $args forwards verbatim.
   $hadConfig = Test-Path Env:CODEX_HOME
   $previousConfig = $env:CODEX_HOME
   if (-not $hadConfig) {
@@ -143,7 +143,7 @@ function global:codex {
 
   try {
     $command = Get-Command codex -CommandType Application -ErrorAction Stop | Select-Object -First 1
-    & $command.Source @Arguments
+    & $command.Source @args
     $exitCode = $LASTEXITCODE
     $global:LASTEXITCODE = $exitCode
   } finally {

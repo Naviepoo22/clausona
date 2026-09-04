@@ -9,7 +9,12 @@ export type SharedLinkInfo = {
 
 function samePath(left: string, right: string): boolean {
   const normalize = (value: string) => {
-    const resolved = path.resolve(value).replace(/^\\\\\?\\/, "");
+    // Strip the long-path prefix. UNC first: \\?\UNC\server\share is \\server\share,
+    // not UNC\server\share.
+    const resolved = path
+      .resolve(value)
+      .replace(/^\\\\\?\\UNC\\/, "\\\\")
+      .replace(/^\\\\\?\\/, "");
     return process.platform === "win32" ? resolved.toLowerCase() : resolved;
   };
   return normalize(left) === normalize(right);
@@ -43,8 +48,16 @@ export async function inspectSharedLink(target: string, source: string): Promise
 
   if (targetStats.isFile()) {
     const sourceStats = await stat(source).catch(() => null);
+    // A zero inode means the filesystem could not report a file index (some Windows
+    // network drives). Comparing 0 === 0 would call two unrelated files the same file,
+    // and setupSharedLinks deletes what it believes is a shared link without backing
+    // it up first — so an unusable identity is treated as "not a link".
+    const identifiable = Boolean(targetStats.ino) && Boolean(sourceStats?.ino);
     const sameFile = Boolean(
-      sourceStats?.isFile() && sourceStats.dev === targetStats.dev && sourceStats.ino === targetStats.ino,
+      identifiable &&
+        sourceStats?.isFile() &&
+        sourceStats.dev === targetStats.dev &&
+        sourceStats.ino === targetStats.ino,
     );
     return { isSharedLink: sameFile, pointsToSource: sameFile, targetExists: true };
   }

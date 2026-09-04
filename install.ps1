@@ -7,7 +7,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $AppName = "clausona"
-$Repository = "Naviepoo22/clausona"
+$Repository = "larcane97/clausona"
 $LocalAppData = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME "AppData\Local" }
 $AppDir = Join-Path $LocalAppData $AppName
 $BinDir = Join-Path $HOME ".local\bin"

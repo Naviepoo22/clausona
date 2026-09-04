@@ -5,6 +5,7 @@ import path from "node:path";
 import { evaluateSymlinkHealth } from "../core/doctor.js";
 import { backupDirFor, claudeJsonPathForConfigDir } from "../core/paths.js";
 import { spawnCommand } from "../core/process.js";
+import { collectQuotas, type QuotaTarget } from "../core/quota-store.js";
 import { isV1Registry, migrateRegistryV1toV2, setActiveProfile } from "../core/registry.js";
 import { createSharedLink, inspectSharedLink } from "../core/shared-links.js";
 import { renderShellInit } from "../core/shell.js";
@@ -18,6 +19,7 @@ import type {
   DoctorProfileResult,
   Profile,
   ProfileListItem,
+  QuotaSnapshot,
   Registry,
   RegistryV1,
   ToolName,
@@ -677,7 +679,16 @@ export async function initializeRegistry(options: {
   return registry;
 }
 
-export async function listProfiles(): Promise<ProfileListItem[]> {
+export type ListProfilesOptions = {
+  /** Attach plan quota from each tool's usage endpoint. Off for callers that must stay offline. */
+  quota?: boolean;
+  /** Bypass the quota cache and re-fetch. */
+  refresh?: boolean;
+  /** Renew lapsed access tokens instead of reporting them as expired. Default on. */
+  renew?: boolean;
+};
+
+export async function listProfiles(options: ListProfilesOptions = {}): Promise<ProfileListItem[]> {
   const registry = await loadRegistry();
   if (!registry) {
     return [];
@@ -686,7 +697,19 @@ export async function listProfiles(): Promise<ProfileListItem[]> {
   const usage = await loadUsageStore();
   const now = new Date().toISOString(); // summarizeUsage interprets cutoffs in the runtime's local timezone
 
-  return Object.entries(registry.profiles).map(([id, profile]) => {
+  const entries = Object.entries(registry.profiles);
+
+  let quotas: Record<string, QuotaSnapshot> = {};
+  if (options.quota) {
+    const targets: QuotaTarget[] = entries.map(([id, profile]) => ({
+      id,
+      tool: profile.tool,
+      configDir: profile.configDir,
+    }));
+    quotas = await collectQuotas(targets, { refresh: options.refresh, renew: options.renew });
+  }
+
+  return entries.map(([id, profile]) => {
     const records = usage[id]?.records ?? [];
     return {
       name: id,
@@ -697,12 +720,27 @@ export async function listProfiles(): Promise<ProfileListItem[]> {
       isPrimary: Boolean(profile.isPrimary),
       isActive: registry.activeProfiles[profile.tool] === id,
       mergeSessions: profile.mergeSessions,
+      quota: quotas[id],
       today: summarizeUsage({ now, period: "today", records }),
       week: summarizeUsage({ now, period: "week", records }),
       month: summarizeUsage({ now, period: "month", records }),
       total: summarizeUsage({ now, period: "all", records }),
     };
   });
+}
+
+/**
+ * Resolves quota for already-listed profiles. Split out from listProfiles so the TUI
+ * can paint immediately and fill quota in once the network settles.
+ */
+export async function fetchProfileQuotas(
+  items: Pick<ProfileListItem, "name" | "tool" | "configDir">[],
+  options: { refresh?: boolean; renew?: boolean } = {},
+): Promise<Record<string, QuotaSnapshot>> {
+  return collectQuotas(
+    items.map((item) => ({ id: item.name, tool: item.tool, configDir: item.configDir })),
+    options,
+  );
 }
 
 export async function setActiveProfileByName(id: string) {
