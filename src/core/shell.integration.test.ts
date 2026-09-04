@@ -7,6 +7,9 @@ import { describe, expect, it } from "vitest";
 import { renderPowerShellInit, renderShellInit } from "./shell.js";
 
 const ZSH_AVAILABLE = spawnSync("which", ["zsh"]).status === 0;
+
+/** Room for the 10s spawn timeout below plus interpreter startup. */
+const POWERSHELL_TEST_TIMEOUT_MS = 30_000;
 const describeIfZsh = ZSH_AVAILABLE ? describe : describe.skip;
 
 function makeTmpDir(): string {
@@ -135,52 +138,65 @@ describeIfZsh("_clausona_resolve (real zsh integration)", () => {
 const describeIfPowerShell = process.platform === "win32" ? describe : describe.skip;
 
 describeIfPowerShell("PowerShell wrapper integration", () => {
-  it("sets the active profile environment and preserves metacharacters in arguments", () => {
-    const tmpDir = makeTmpDir();
-    const profilesPath = path.join(tmpDir, "profiles.json");
-    const claudeDir = path.join(tmpDir, ".claude");
-    const workDir = path.join(tmpDir, ".claude-work");
-    const binDir = path.join(tmpDir, "bin");
-    mkdirSync(claudeDir, { recursive: true });
-    mkdirSync(workDir, { recursive: true });
-    mkdirSync(binDir, { recursive: true });
-    writeRegistry(profilesPath, {
-      version: 2,
-      primarySources: { claude: claudeDir },
-      activeProfiles: { claude: "claude:work" },
-      profiles: {
-        "claude:work": {
-          tool: "claude",
-          configDir: workDir,
-          email: "a@x",
-          isPrimary: false,
+  it(
+    "sets the active profile environment and preserves metacharacters in arguments",
+    () => {
+      const tmpDir = makeTmpDir();
+      const profilesPath = path.join(tmpDir, "profiles.json");
+      const claudeDir = path.join(tmpDir, ".claude");
+      const workDir = path.join(tmpDir, ".claude-work");
+      const binDir = path.join(tmpDir, "bin");
+      mkdirSync(claudeDir, { recursive: true });
+      mkdirSync(workDir, { recursive: true });
+      mkdirSync(binDir, { recursive: true });
+      writeRegistry(profilesPath, {
+        version: 2,
+        primarySources: { claude: claudeDir },
+        activeProfiles: { claude: "claude:work" },
+        profiles: {
+          "claude:work": {
+            tool: "claude",
+            configDir: workDir,
+            email: "a@x",
+            isPrimary: false,
+          },
         },
-      },
-    });
-    writeFileSync(path.join(binDir, "clausona.cmd"), "@echo off\r\nexit /b 0\r\n");
-    writeFileSync(
-      path.join(binDir, "claude.cmd"),
-      `@echo off\r\nnode -e "process.stdout.write(process.env.CLAUDE_CONFIG_DIR + '|' + process.argv[1])" %*\r\n`,
-    );
+      });
+      writeFileSync(path.join(binDir, "clausona.cmd"), "@echo off\r\nexit /b 0\r\n");
+      writeFileSync(
+        path.join(binDir, "claude.cmd"),
+        `@echo off\r\nnode -e "process.stdout.write(process.env.CLAUDE_CONFIG_DIR + '|' + process.argv[1])" %*\r\n`,
+      );
 
-    const escapedProfilesPath = profilesPath.replaceAll("'", "''");
-    const script = renderPowerShellInit().replace(
-      '$profilesPath = Join-Path $HOME ".clausona\\profiles.json"',
-      `$profilesPath = '${escapedProfilesPath}'`,
-    );
-    const result = spawnSync(
-      "powershell.exe",
-      ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", `${script}\nclaude 'hello & echo INJECTED'`],
-      {
-        encoding: "utf8",
-        env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` },
-        timeout: 10000,
-      },
-    );
+      const escapedProfilesPath = profilesPath.replaceAll("'", "''");
+      const script = renderPowerShellInit().replace(
+        '$profilesPath = Join-Path $HOME ".clausona\\profiles.json"',
+        `$profilesPath = '${escapedProfilesPath}'`,
+      );
+      const result = spawnSync(
+        "powershell.exe",
+        [
+          "-NoLogo",
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          `${script}\nclaude 'hello & echo INJECTED'`,
+        ],
+        {
+          encoding: "utf8",
+          env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` },
+          timeout: 10000,
+        },
+      );
 
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(result.stdout).toBe(`${workDir}|hello & echo INJECTED`);
-    rmSync(tmpDir, { recursive: true, force: true });
-  });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe(`${workDir}|hello & echo INJECTED`);
+      rmSync(tmpDir, { recursive: true, force: true });
+    },
+    // Cold powershell.exe startup on a CI runner took 5.4s, over vitest's 5s default, so
+    // the test was killed before it could assert. Must exceed the spawn timeout above.
+    POWERSHELL_TEST_TIMEOUT_MS,
+  );
 });
